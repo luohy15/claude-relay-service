@@ -16,6 +16,7 @@ const requestIdentityService = require('../requestIdentityService')
 const { createClaudeTestPayload } = require('../../utils/testPayloadHelper')
 const userMessageQueueService = require('../userMessageQueueService')
 const { isStreamWritable } = require('../../utils/streamHelper')
+const { attachHeartbeat } = require('../../utils/sseHeartbeat')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
 const metadataUserIdHelper = require('../../utils/metadataUserIdHelper')
 const {
@@ -2145,6 +2146,16 @@ class ClaudeRelayService {
         timeout: config.requestTimeout || 600000
       }
 
+      // 上游 thinking 静默 >120s 会触发 CF 524；声明心跳句柄供 200 成功路径启动、
+      // 各种结束/异常路径统一清理
+      let heartbeat = null
+      const stopHeartbeat = () => {
+        if (heartbeat) {
+          heartbeat.stop()
+          heartbeat = null
+        }
+      }
+
       const req = https.request(options, async (res) => {
         logger.debug(`🌊 Claude stream response status: ${res.statusCode}`)
 
@@ -2605,6 +2616,13 @@ class ClaudeRelayService {
           }
         }
 
+        // 💓 启动 SSE 心跳：上游 thinking 期间静默 >120s 会被 Cloudflare 524，
+        // 每 15s 在客户端连接上写入 `: heartbeat\n\n` 注释保活
+        heartbeat = attachHeartbeat(responseStream, {
+          logger,
+          label: `Official:${account?.name || accountId}`
+        })
+
         let buffer = ''
         const allUsageData = [] // 收集所有的usage事件
         let currentUsageData = {} // 当前正在收集的usage数据
@@ -2623,6 +2641,7 @@ class ClaudeRelayService {
           dataSource = res.pipe(zlib.createGunzip())
           dataSource.on('error', (err) => {
             logger.error('❌ Gzip decompression error in stream:', err.message)
+            stopHeartbeat()
             if (isStreamWritable(responseStream)) {
               responseStream.end()
             }
@@ -2631,6 +2650,7 @@ class ClaudeRelayService {
           dataSource = res.pipe(zlib.createInflate())
           dataSource.on('error', (err) => {
             logger.error('❌ Deflate decompression error in stream:', err.message)
+            stopHeartbeat()
             if (isStreamWritable(responseStream)) {
               responseStream.end()
             }
@@ -2659,6 +2679,10 @@ class ClaudeRelayService {
                   }
                 } else {
                   responseStream.write(linesToForward)
+                }
+                // 💓 每次成功转发后重置心跳静默计时
+                if (heartbeat) {
+                  heartbeat.markData()
                 }
               } else {
                 // 客户端连接已断开，记录警告（但仍继续解析usage）
@@ -2783,6 +2807,8 @@ class ClaudeRelayService {
         })
 
         dataSource.on('end', async () => {
+          // 💓 上游已结束，停止心跳计时器
+          stopHeartbeat()
           try {
             // 处理缓冲区中剩余的数据
             if (buffer.trim() && isStreamWritable(responseStream)) {
@@ -2987,6 +3013,8 @@ class ClaudeRelayService {
       })
 
       req.on('error', async (error) => {
+        // 💓 上游连接异常，停止心跳
+        stopHeartbeat()
         logger.error(
           `❌ Claude stream request error (Account: ${account?.name || accountId}):`,
           error.message,
@@ -3045,6 +3073,8 @@ class ClaudeRelayService {
       })
 
       req.on('timeout', async () => {
+        // 💓 上游超时，停止心跳
+        stopHeartbeat()
         req.destroy()
         logger.error(`❌ Claude stream request timeout | Account: ${account?.name || accountId}`)
 
@@ -3079,6 +3109,8 @@ class ClaudeRelayService {
 
       // 处理客户端断开连接
       responseStream.on('close', () => {
+        // 💓 客户端已断开，停止心跳
+        stopHeartbeat()
         logger.debug('🔌 Client disconnected, cleaning up stream')
         if (!req.destroyed) {
           req.destroy(new Error('Client disconnected'))

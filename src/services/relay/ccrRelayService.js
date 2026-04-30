@@ -6,6 +6,7 @@ const { parseVendorPrefixedModel } = require('../../utils/modelHelper')
 const userMessageQueueService = require('../userMessageQueueService')
 const { isStreamWritable } = require('../../utils/streamHelper')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const { attachHeartbeat } = require('../../utils/sseHeartbeat')
 
 class CcrRelayService {
   constructor() {
@@ -572,6 +573,14 @@ class CcrRelayService {
   ) {
     return new Promise((resolve, reject) => {
       let aborted = false
+      // 上游 thinking 静默 >120s 会触发 CF 524；声明心跳句柄，200 成功路径启动、各种结束/异常路径统一清理
+      let heartbeat = null
+      const stopHeartbeat = () => {
+        if (heartbeat) {
+          heartbeat.stop()
+          heartbeat = null
+        }
+      }
 
       // 构建完整的API URL
       const cleanUrl = account.apiUrl.replace(/\/$/, '') // 移除末尾斜杠
@@ -758,6 +767,13 @@ class CcrRelayService {
             responseStream.writeHead(200, headers)
           }
 
+          // 💓 启动 SSE 心跳：上游 thinking 期间静默 >120s 会被 Cloudflare 524，
+          // 每 15s 在客户端连接上写入 `: heartbeat\n\n` 注释保活
+          heartbeat = attachHeartbeat(responseStream, {
+            logger,
+            label: `CCR:${account?.name || accountId}`
+          })
+
           // 处理流数据和使用统计收集
           let rawBuffer = ''
           const collectedUsage = {}
@@ -775,6 +791,7 @@ class CcrRelayService {
               const lines = rawBuffer.split('\n')
               rawBuffer = lines.pop() // 保留最后一个可能不完整的行
 
+              let wroteToClient = false
               for (const line of lines) {
                 if (line.trim()) {
                   // 解析 SSE 数据并收集使用统计
@@ -792,6 +809,7 @@ class CcrRelayService {
                   // 写入到响应流
                   if (outputLine && isStreamWritable(responseStream)) {
                     responseStream.write(`${outputLine}\n`)
+                    wroteToClient = true
                   } else if (outputLine) {
                     // 客户端连接已断开，记录警告
                     logger.warn(
@@ -802,8 +820,13 @@ class CcrRelayService {
                   // 空行也需要传递
                   if (isStreamWritable(responseStream)) {
                     responseStream.write('\n')
+                    wroteToClient = true
                   }
                 }
+              }
+              // 💓 至少有一行成功写入客户端时，重置心跳静默计时
+              if (wroteToClient && heartbeat) {
+                heartbeat.markData()
               }
             } catch (err) {
               logger.error('❌ Error processing SSE chunk:', err)
@@ -811,6 +834,8 @@ class CcrRelayService {
           })
 
           response.data.on('end', () => {
+            // 💓 上游已结束，停止心跳计时器
+            stopHeartbeat()
             // 如果收集到使用统计数据，调用回调
             if (usageCallback && Object.keys(collectedUsage).length > 0) {
               try {
@@ -840,6 +865,8 @@ class CcrRelayService {
           })
 
           response.data.on('error', (err) => {
+            // 💓 上游流异常，停止心跳
+            stopHeartbeat()
             logger.error('❌ Stream data error:', err)
             if (isStreamWritable(responseStream)) {
               responseStream.end()
@@ -849,6 +876,8 @@ class CcrRelayService {
 
           // 客户端断开处理
           responseStream.on('close', () => {
+            // 💓 客户端已断开，停止心跳
+            stopHeartbeat()
             logger.info('🔌 Client disconnected from CCR stream')
             aborted = true
             if (response.data && typeof response.data.destroy === 'function') {
@@ -857,11 +886,15 @@ class CcrRelayService {
           })
 
           responseStream.on('error', (err) => {
+            // 💓 客户端连接异常，停止心跳
+            stopHeartbeat()
             logger.error('❌ Response stream error:', err)
             aborted = true
           })
         })
         .catch((error) => {
+          // 💓 请求异常，停止心跳
+          stopHeartbeat()
           if (!responseStream.headersSent) {
             responseStream.writeHead(500, { 'Content-Type': 'application/json' })
           }

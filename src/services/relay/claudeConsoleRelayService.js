@@ -13,6 +13,7 @@ const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
 const userMessageQueueService = require('../userMessageQueueService')
 const { isStreamWritable } = require('../../utils/streamHelper')
 const { filterForClaude } = require('../../utils/headerFilter')
+const { attachHeartbeat } = require('../../utils/sseHeartbeat')
 
 class ClaudeConsoleRelayService {
   constructor() {
@@ -755,6 +756,14 @@ class ClaudeConsoleRelayService {
   ) {
     return new Promise((resolve, reject) => {
       let aborted = false
+      // 上游 thinking 静默 >120s 会触发 CF 524；声明心跳句柄，200 成功路径启动、各种结束/异常路径统一清理
+      let heartbeat = null
+      const stopHeartbeat = () => {
+        if (heartbeat) {
+          heartbeat.stop()
+          heartbeat = null
+        }
+      }
 
       // 构建完整的API URL
       const cleanUrl = account.apiUrl.replace(/\/$/, '') // 移除末尾斜杠
@@ -993,6 +1002,13 @@ class ClaudeConsoleRelayService {
             })
           }
 
+          // 💓 启动 SSE 心跳：上游 thinking 期间静默 >120s 会被 Cloudflare 524，
+          // 每 15s 在客户端连接上写入 `: heartbeat\n\n` 注释保活
+          heartbeat = attachHeartbeat(responseStream, {
+            logger,
+            label: `Console:${account?.name || accountId}`
+          })
+
           let buffer = ''
           let finalUsageReported = false
           const collectedUsageData = {
@@ -1032,6 +1048,10 @@ class ClaudeConsoleRelayService {
 
                   if (dataToWrite) {
                     responseStream.write(dataToWrite)
+                    // 💓 每次成功转发后重置心跳静默计时
+                    if (heartbeat) {
+                      heartbeat.markData()
+                    }
                   }
                 } else {
                   // 客户端连接已断开，记录警告（但仍继续解析usage）
@@ -1169,6 +1189,8 @@ class ClaudeConsoleRelayService {
           })
 
           response.data.on('end', () => {
+            // 💓 上游已结束，停止心跳计时器
+            stopHeartbeat()
             try {
               // 处理缓冲区中剩余的数据
               if (buffer.trim() && isStreamWritable(responseStream)) {
@@ -1254,6 +1276,8 @@ class ClaudeConsoleRelayService {
           })
 
           response.data.on('error', (error) => {
+            // 💓 上游流异常，停止心跳
+            stopHeartbeat()
             logger.error(
               `❌ Claude Console stream error (Account: ${account?.name || accountId}):`,
               error
@@ -1280,6 +1304,8 @@ class ClaudeConsoleRelayService {
           })
         })
         .catch((error) => {
+          // 💓 请求异常，停止心跳
+          stopHeartbeat()
           if (aborted) {
             return
           }
@@ -1361,6 +1387,8 @@ class ClaudeConsoleRelayService {
 
       // 处理客户端断开连接
       responseStream.on('close', () => {
+        // 💓 客户端已断开，停止心跳
+        stopHeartbeat()
         logger.debug('🔌 Client disconnected, cleaning up Claude Console stream')
         aborted = true
       })
