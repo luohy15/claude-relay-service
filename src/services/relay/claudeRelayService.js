@@ -1323,6 +1323,10 @@ class ClaudeRelayService {
       }
 
       contentArray.forEach((item) => {
+        // 永不修改 thinking/redacted_thinking 块，否则上游会返回 400
+        if (item && (item.type === 'thinking' || item.type === 'redacted_thinking')) {
+          return
+        }
         if (item && typeof item === 'object' && item.cache_control) {
           if (item.cache_control.ttl) {
             delete item.cache_control.ttl
@@ -1353,6 +1357,10 @@ class ClaudeRelayService {
       return
     }
 
+    // thinking/redacted_thinking 块不可被修改，既不计入限额也不参与移除
+    const isThinkingBlock = (item) =>
+      item && (item.type === 'thinking' || item.type === 'redacted_thinking')
+
     const countCacheControlBlocks = () => {
       let total = 0
 
@@ -1362,7 +1370,7 @@ class ClaudeRelayService {
             return
           }
           message.content.forEach((item) => {
-            if (item && item.cache_control) {
+            if (item && item.cache_control && !isThinkingBlock(item)) {
               total += 1
             }
           })
@@ -1394,7 +1402,7 @@ class ClaudeRelayService {
 
         for (let contentIndex = 0; contentIndex < message.content.length; contentIndex += 1) {
           const contentItem = message.content[contentIndex]
-          if (contentItem && contentItem.cache_control) {
+          if (contentItem && contentItem.cache_control && !isThinkingBlock(contentItem)) {
             // 只删除 cache_control 属性，保留内容
             delete contentItem.cache_control
             return true
