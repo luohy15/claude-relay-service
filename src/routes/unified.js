@@ -442,6 +442,24 @@ router.post('/v1/completions', authenticateApiKey, async (req, res) => {
   }
 })
 
+// 🔄 OpenAI Responses（Codex 协议）端点路由处理器
+// 🛣️ 统一 /api 挂载点：将非原生前缀（claude-/gemini-/gpt-）的模型直接路由到 openai-responses
+// 后端，body 原样转发（_fromUnifiedEndpoint=true 让 isStandardResponsesRoute 返回 false，走 relay
+// 转发到 OpenRouter 等 OpenAI 兼容上游），从而让 per-model usage 落到 user-model-stats。
+// 原生 gpt 模型仍走标准 codex responses 流程；/openai 挂载点 baseUrl!=='/api'，标志永不置位，零回归。
+async function handleResponsesRoute(req, res) {
+  const requestedModel = req.body?.model || ''
+  if (req.baseUrl === '/api' && !isNativeModelPrefix(requestedModel)) {
+    req._fromUnifiedEndpoint = true
+  }
+  return await openaiRoutes.handleResponses(req, res)
+}
+
+router.post('/responses', authenticateApiKey, handleResponsesRoute)
+router.post('/v1/responses', authenticateApiKey, handleResponsesRoute)
+router.post('/responses/compact', authenticateApiKey, handleResponsesRoute)
+router.post('/v1/responses/compact', authenticateApiKey, handleResponsesRoute)
+
 // --- OpenAI Chat Completions → Gemini 原生请求转换（OpenAI → Gemini 格式映射） ---
 
 function buildGeminiRequestFromOpenAI(body) {
