@@ -42,6 +42,16 @@ function detectBackendFromModel(modelName) {
   return 'claude'
 }
 
+// 🧭 判断模型 id 是否为原生前缀（claude-/gemini-/gpt-）
+function isNativeModelPrefix(modelName) {
+  if (!modelName) {
+    return false
+  }
+
+  const model = modelName.toLowerCase()
+  return model.startsWith('claude-') || model.startsWith('gemini-') || model.startsWith('gpt-')
+}
+
 // 🚀 智能后端路由处理器
 async function routeToBackend(req, res, requestedModel) {
   const backend = detectBackendFromModel(requestedModel)
@@ -352,6 +362,15 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
 
     const requestedModel = req.body.model || 'claude-3-5-sonnet-20241022'
     req.body.model = requestedModel // 确保模型已设置
+
+    // 🛣️ 统一 /api 挂载点：按请求路径将非原生前缀（claude-/gemini-/gpt-）的模型直接路由到
+    // openai-responses 后端，body 原样转发（providerEndpoint=auto 时 relay 转发到 baseApi+req.path，
+    // 如 OpenRouter 的 /v1/chat/completions），从而让 OpenAI 兼容上游的 per-model usage 落到 user-model-stats。
+    // 原生前缀仍走 detectBackendFromModel；/openai 挂载点保持原有行为，零回归。
+    if (req.baseUrl === '/api' && !isNativeModelPrefix(requestedModel)) {
+      req._fromUnifiedEndpoint = true
+      return await openaiRoutes.handleResponses(req, res)
+    }
 
     // 使用统一的后端路由处理器
     await routeToBackend(req, res, requestedModel)
