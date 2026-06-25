@@ -8,7 +8,11 @@ const unifiedClaudeScheduler = require('../services/scheduler/unifiedClaudeSched
 const apiKeyService = require('../services/apiKeyService')
 const { authenticateApiKey } = require('../middleware/auth')
 const logger = require('../utils/logger')
-const { getEffectiveModel, parseVendorPrefixedModel } = require('../utils/modelHelper')
+const {
+  getEffectiveModel,
+  parseVendorPrefixedModel,
+  isNativeModelPrefix
+} = require('../utils/modelHelper')
 const sessionHelper = require('../utils/sessionHelper')
 const { updateRateLimitCounters } = require('../utils/rateLimitHelper')
 const claudeRelayConfigService = require('../services/claudeRelayConfigService')
@@ -142,6 +146,15 @@ async function handleMessagesRequest(req, res) {
     const forcedVendor = req._anthropicVendor || null
     const requiredService =
       forcedVendor === 'gemini-cli' || forcedVendor === 'antigravity' ? 'gemini' : 'claude'
+
+    // 🛣️ /api 挂载点：非原生前缀（claude-/gemini-/gpt-）的模型走 openai-responses(OpenRouter) 后端，
+    // 让 Anthropic-Messages 流量的 per-model usage 落到 user-model-stats；原生 claude 模型零回归。
+    // 必须在 Claude 权限校验之前：OpenRouter 的 cr_ key 只有 openai 权限，否则会被 403。
+    if (req.baseUrl === '/api' && !forcedVendor && !isNativeModelPrefix(req.body?.model)) {
+      req._fromUnifiedEndpoint = true
+      const openaiRoutes = require('./openaiRoutes') // lazy require, avoid app.js circular load
+      return await openaiRoutes.handleResponses(req, res)
+    }
 
     if (!apiKeyService.hasPermission(req.apiKey?.permissions, requiredService)) {
       return res.status(403).json({
