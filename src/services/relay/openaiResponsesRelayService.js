@@ -528,6 +528,28 @@ class OpenAIResponsesRelayService {
               }
             }
 
+            // Anthropic Messages SSE (OpenRouter /api/v1/messages): capture model + usage,
+            // normalized into the OpenAI-Responses shape so downstream recordUsage math is unchanged.
+            if (eventData.type === 'message_start' && eventData.message) {
+              actualModel = eventData.message.model || actualModel
+              const u = eventData.message.usage || {}
+              const cacheRead = u.cache_read_input_tokens || 0
+              usageData = {
+                // downstream computes actualInput = input_tokens - cacheRead; Anthropic input_tokens already
+                // EXCLUDES cache reads, so add cacheRead back here to keep the subtraction correct.
+                input_tokens: (u.input_tokens || 0) + cacheRead,
+                output_tokens: u.output_tokens || 0,
+                input_tokens_details: { cached_tokens: cacheRead }, // read by extractOpenAICacheReadTokens
+                cache_creation_input_tokens: u.cache_creation_input_tokens || 0 // read by extractCacheCreationTokens
+              }
+            }
+            // message_delta carries the FINAL cumulative output_tokens
+            if (eventData.type === 'message_delta' && eventData.usage && usageData) {
+              if (typeof eventData.usage.output_tokens === 'number') {
+                usageData.output_tokens = eventData.usage.output_tokens
+              }
+            }
+
             // 检查是否有限流错误
             if (eventData.error) {
               // 检查多种可能的限流错误类型

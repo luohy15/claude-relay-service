@@ -231,11 +231,30 @@ function isClaudeFamilyModel(modelName) {
   return false
 }
 
+/**
+ * 判断模型 id 是否为原生前缀（claude-/gemini-/gpt-）。
+ *
+ * 用于路径分流：原生前缀走对应的原生后端（Claude/Gemini/OpenAI），非原生前缀
+ * （如 OpenRouter 的 anthropic/claude-sonnet-4.6、x-ai/grok-4.3）走 openai-responses 后端。
+ *
+ * @param {string} modelName - Model name
+ * @returns {boolean} - Whether the model id has a native prefix
+ */
+function isNativeModelPrefix(modelName) {
+  if (!modelName) {
+    return false
+  }
+
+  const model = modelName.toLowerCase()
+  return model.startsWith('claude-') || model.startsWith('gemini-') || model.startsWith('gpt-')
+}
+
 module.exports = {
   parseVendorPrefixedModel,
   hasVendorPrefix,
   getEffectiveModel,
   getVendorType,
   isOpus45OrNewer,
-  isClaudeFamilyModel
+  isClaudeFamilyModel,
+  isNativeModelPrefix
 }
