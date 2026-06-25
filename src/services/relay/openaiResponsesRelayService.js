@@ -565,10 +565,25 @@ class OpenAIResponsesRelayService {
                 cache_creation_input_tokens: u.cache_creation_input_tokens || 0 // read by extractCacheCreationTokens
               }
             }
-            // message_delta carries the FINAL cumulative output_tokens
+            // message_delta carries the FINAL cumulative output_tokens, and on some
+            // OpenRouter Anthropic streams the FINAL input_tokens too (message_start reports 0).
             if (eventData.type === 'message_delta' && eventData.usage && usageData) {
               if (typeof eventData.usage.output_tokens === 'number') {
                 usageData.output_tokens = eventData.usage.output_tokens
+              }
+              // Re-normalize input when the delta carries it (Anthropic input_tokens EXCLUDES
+              // cache reads, so add cacheRead back to keep downstream subtraction correct).
+              if (typeof eventData.usage.input_tokens === 'number') {
+                const cacheRead =
+                  eventData.usage.cache_read_input_tokens ??
+                  usageData.input_tokens_details?.cached_tokens ??
+                  0
+                usageData.input_tokens = eventData.usage.input_tokens + cacheRead
+                usageData.input_tokens_details = { cached_tokens: cacheRead }
+                if (typeof eventData.usage.cache_creation_input_tokens === 'number') {
+                  usageData.cache_creation_input_tokens =
+                    eventData.usage.cache_creation_input_tokens
+                }
               }
             }
 
