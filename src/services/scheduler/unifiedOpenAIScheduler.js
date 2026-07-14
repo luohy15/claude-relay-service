@@ -1,5 +1,6 @@
 const openaiAccountService = require('../account/openaiAccountService')
 const openaiResponsesAccountService = require('../account/openaiResponsesAccountService')
+const grokAccountService = require('../account/grokAccountService')
 const accountGroupService = require('../accountGroupService')
 const redis = require('../../models/redis')
 const logger = require('../../utils/logger')
@@ -51,8 +52,32 @@ class UnifiedOpenAIScheduler {
     return false
   }
 
+  // 🔍 判断请求的模型是否是 Grok 系列模型（grok-4.5 / grok-4.5-build / grok-composer-... 等）
+  _isGrokModel(model) {
+    return typeof model === 'string' && model.toLowerCase().startsWith('grok')
+  }
+
+  // 🔍 校验账户类型与请求模型是否兼容上游固定后端
+  // openai（ChatGPT/Codex OAuth）固定转发到 chatgpt.com，grok（grok.com 订阅 OAuth）固定转发到
+  // cli-chat-proxy.grok.com；两者互不兼容，共享池/分组选择必须按 requestedModel 区分，避免把
+  // grok 模型路由到 ChatGPT 后端，或把 GPT 模型路由到 grok 后端。
+  // openai-responses 是通用第三方兼容 API，按设计保持"支持所有模型"不做限制。
+  _isAccountTypeCompatibleWithModel(accountType, requestedModel) {
+    if (accountType === 'openai') {
+      return !requestedModel || !this._isGrokModel(requestedModel)
+    }
+    if (accountType === 'grok') {
+      return !!requestedModel && this._isGrokModel(requestedModel)
+    }
+    return true
+  }
+
   // ✅ 确保账号在调度前完成限流恢复与 schedulable 校正
-  async _ensureAccountReadyForScheduling(account, accountId, { sanitized = true } = {}) {
+  async _ensureAccountReadyForScheduling(
+    account,
+    accountId,
+    { sanitized = true, accountType = 'openai' } = {}
+  ) {
     const hasRateLimitFlag = this._hasRateLimitFlag(account.rateLimitStatus)
     let rateLimitChecked = false
     let stillLimited = false
@@ -64,7 +89,7 @@ class UnifiedOpenAIScheduler {
         return { canUse: false, reason: 'not_schedulable' }
       }
 
-      stillLimited = await this.isAccountRateLimited(accountId)
+      stillLimited = await this.isAccountRateLimited(accountId, accountType)
       rateLimitChecked = true
       if (stillLimited) {
         return { canUse: false, reason: 'rate_limited' }
@@ -81,7 +106,7 @@ class UnifiedOpenAIScheduler {
 
     if (hasRateLimitFlag) {
       if (!rateLimitChecked) {
-        stillLimited = await this.isAccountRateLimited(accountId)
+        stillLimited = await this.isAccountRateLimited(accountId, accountType)
         rateLimitChecked = true
       }
       if (stillLimited) {
@@ -132,7 +157,7 @@ class UnifiedOpenAIScheduler {
           return await this.selectAccountFromGroup(groupId, sessionHash, requestedModel, apiKeyData)
         }
 
-        // 普通专属账户 - 根据前缀判断是 OpenAI 还是 OpenAI-Responses 类型
+        // 普通专属账户 - 根据前缀判断是 OpenAI、OpenAI-Responses 还是 Grok 类型
         let boundAccount = null
         let accountType = 'openai'
 
@@ -141,6 +166,10 @@ class UnifiedOpenAIScheduler {
           const accountId = apiKeyData.openaiAccountId.replace('responses:', '')
           boundAccount = await openaiResponsesAccountService.getAccount(accountId)
           accountType = 'openai-responses'
+        } else if (apiKeyData.openaiAccountId.startsWith('grok:')) {
+          const accountId = apiKeyData.openaiAccountId.replace('grok:', '')
+          boundAccount = await grokAccountService.getAccount(accountId)
+          accountType = 'grok'
         } else {
           // 普通 OpenAI 账户
           boundAccount = await openaiAccountService.getAccount(apiKeyData.openaiAccountId)
@@ -165,11 +194,11 @@ class UnifiedOpenAIScheduler {
             )
             // 不 throw，让代码继续走到共享池选择
           } else {
-            if (accountType === 'openai') {
+            if (accountType === 'openai' || accountType === 'grok') {
               const readiness = await this._ensureAccountReadyForScheduling(
                 boundAccount,
                 boundAccount.id,
-                { sanitized: false }
+                { sanitized: false, accountType }
               )
 
               if (!readiness.canUse) {
@@ -181,6 +210,27 @@ class UnifiedOpenAIScheduler {
                 const error = new Error(errorMsg)
                 error.statusCode = isRateLimited ? 429 : 403
                 throw error
+              }
+
+              // grok 账户使用 OAuth access token，需要在调度前保证未过期
+              if (accountType === 'grok' && grokAccountService.isTokenExpired(boundAccount)) {
+                if (!boundAccount.refreshToken) {
+                  const errorMsg = `Dedicated account ${boundAccount.name} token expired and no refresh token available`
+                  logger.warn(`⚠️ ${errorMsg}`)
+                  const error = new Error(errorMsg)
+                  error.statusCode = 403
+                  throw error
+                }
+                try {
+                  await grokAccountService.refreshAccountToken(boundAccount.id)
+                  boundAccount = await grokAccountService.getAccount(boundAccount.id)
+                } catch (refreshError) {
+                  const errorMsg = `Dedicated account ${boundAccount.name} token refresh failed: ${refreshError.message}`
+                  logger.warn(`⚠️ ${errorMsg}`)
+                  const error = new Error(errorMsg)
+                  error.statusCode = 403
+                  throw error
+                }
               }
             } else {
               const hasRateLimitFlag = this._isRateLimited(boundAccount.rateLimitStatus)
@@ -367,6 +417,14 @@ class UnifiedOpenAIScheduler {
         account.status !== 'error' &&
         (account.accountType === 'shared' || !account.accountType) // 兼容旧数据
       ) {
+        // Grok 模型固定走 cli-chat-proxy.grok.com，不能路由到 ChatGPT/Codex 后端
+        if (!this._isAccountTypeCompatibleWithModel('openai', requestedModel)) {
+          logger.debug(
+            `⏭️ Skipping OpenAI account ${account.name} - requested model ${requestedModel} is a Grok model`
+          )
+          continue
+        }
+
         const accountId = account.id || account.accountId
 
         const readiness = await this._ensureAccountReadyForScheduling(account, accountId, {
@@ -515,6 +573,75 @@ class UnifiedOpenAIScheduler {
       }
     }
 
+    // 获取所有 Grok（grok.com 订阅 OAuth）账户（共享池）
+    const grokAccounts = await grokAccountService.getAllAccounts()
+    for (let account of grokAccounts) {
+      if (
+        (account.isActive === true || account.isActive === 'true') &&
+        account.status !== 'error' &&
+        (account.accountType === 'shared' || !account.accountType)
+      ) {
+        // Grok 账户只服务于 grok 系列模型，避免被非 grok 请求（如 GPT）误选中
+        if (!this._isAccountTypeCompatibleWithModel('grok', requestedModel)) {
+          logger.debug(
+            `⏭️ Skipping Grok account ${account.name} - requested model ${requestedModel || '(unspecified)'} is not a Grok model`
+          )
+          continue
+        }
+
+        const accountId = account.id || account.accountId
+
+        const readiness = await this._ensureAccountReadyForScheduling(account, accountId, {
+          sanitized: true,
+          accountType: 'grok'
+        })
+
+        if (!readiness.canUse) {
+          if (readiness.reason === 'rate_limited') {
+            logger.debug(`⏭️ 跳过 Grok 账号 ${account.name} - 仍处于限流状态`)
+          } else {
+            logger.debug(`⏭️ 跳过 Grok 账号 ${account.name} - 已被管理员禁用调度`)
+          }
+          continue
+        }
+
+        const isTempUnavailable = await upstreamErrorHelper.isTempUnavailable(accountId, 'grok')
+        if (isTempUnavailable) {
+          logger.debug(`⏭️ Skipping grok account ${account.name} - temporarily unavailable`)
+          continue
+        }
+
+        // 检查token是否过期并自动刷新
+        const isExpired = grokAccountService.isTokenExpired(account)
+        if (isExpired) {
+          if (!account.refreshToken) {
+            logger.warn(
+              `⚠️ Grok account ${account.name} token expired and no refresh token available`
+            )
+            continue
+          }
+
+          try {
+            logger.info(`🔄 Auto-refreshing expired token for Grok account ${account.name}`)
+            await grokAccountService.refreshAccountToken(account.id)
+            account = await grokAccountService.getAccount(account.id)
+            logger.info(`✅ Token refreshed successfully for ${account.name}`)
+          } catch (refreshError) {
+            logger.error(`❌ Failed to refresh token for ${account.name}:`, refreshError.message)
+            continue
+          }
+        }
+
+        availableAccounts.push({
+          ...account,
+          accountId: account.id,
+          accountType: 'grok',
+          priority: parseInt(account.priority) || 50,
+          lastUsedAt: account.lastUsedAt || '0'
+        })
+      }
+    }
+
     return availableAccounts
   }
 
@@ -589,6 +716,42 @@ class UnifiedOpenAIScheduler {
         )
         if (isTempUnavailable) {
           logger.info(`⏱️ OpenAI account ${accountId} (${accountType}) is temporarily unavailable`)
+          return false
+        }
+
+        return true
+      } else if (accountType === 'grok') {
+        const account = await grokAccountService.getAccount(accountId)
+        if (
+          !account ||
+          (account.isActive !== true && account.isActive !== 'true') ||
+          account.status === 'error' ||
+          account.status === 'unauthorized'
+        ) {
+          return false
+        }
+        const readiness = await this._ensureAccountReadyForScheduling(account, accountId, {
+          sanitized: false,
+          accountType: 'grok'
+        })
+
+        if (!readiness.canUse) {
+          if (readiness.reason === 'rate_limited') {
+            logger.debug(
+              `🚫 Grok account ${accountId} still rate limited when checking availability`
+            )
+          } else {
+            logger.info(`🚫 Grok account ${accountId} is not schedulable`)
+          }
+          return false
+        }
+
+        const isTempUnavailable = await upstreamErrorHelper.isTempUnavailable(
+          accountId,
+          accountType
+        )
+        if (isTempUnavailable) {
+          logger.info(`⏱️ Grok account ${accountId} (${accountType}) is temporarily unavailable`)
           return false
         }
 
@@ -681,6 +844,8 @@ class UnifiedOpenAIScheduler {
     try {
       if (accountType === 'openai') {
         await openaiAccountService.setAccountRateLimited(accountId, true, resetsInSeconds)
+      } else if (accountType === 'grok') {
+        await grokAccountService.setAccountRateLimited(accountId, true, resetsInSeconds)
       } else if (accountType === 'openai-responses') {
         // 对于 OpenAI-Responses 账户，使用与普通 OpenAI 账户类似的处理方式
         const account = await openaiResponsesAccountService.getAccount(accountId)
@@ -723,6 +888,8 @@ class UnifiedOpenAIScheduler {
     try {
       if (accountType === 'openai') {
         await openaiAccountService.markAccountUnauthorized(accountId, reason)
+      } else if (accountType === 'grok') {
+        await grokAccountService.markAccountUnauthorized(accountId, reason)
       } else if (accountType === 'openai-responses') {
         await openaiResponsesAccountService.markAccountUnauthorized(accountId, reason)
       } else {
@@ -751,6 +918,8 @@ class UnifiedOpenAIScheduler {
     try {
       if (accountType === 'openai') {
         await openaiAccountService.setAccountRateLimited(accountId, false)
+      } else if (accountType === 'grok') {
+        await grokAccountService.setAccountRateLimited(accountId, false)
       } else if (accountType === 'openai-responses') {
         // 清除 OpenAI-Responses 账户的限流状态
         await openaiResponsesAccountService.updateAccount(accountId, {
@@ -774,10 +943,11 @@ class UnifiedOpenAIScheduler {
     }
   }
 
-  // 🔍 检查账户是否处于限流状态
-  async isAccountRateLimited(accountId) {
+  // 🔍 检查账户是否处于限流状态（openai / grok 共用 setAccountRateLimited 字段形态）
+  async isAccountRateLimited(accountId, accountType = 'openai') {
     try {
-      const account = await openaiAccountService.getAccount(accountId)
+      const service = accountType === 'grok' ? grokAccountService : openaiAccountService
+      const account = await service.getAccount(accountId)
       if (!account) {
         return false
       }
@@ -792,7 +962,7 @@ class UnifiedOpenAIScheduler {
           // 如果已经过了重置时间，自动清除限流状态
           if (!isStillLimited) {
             logger.info(`✅ Auto-clearing rate limit for account ${accountId} (reset time reached)`)
-            await openaiAccountService.setAccountRateLimited(accountId, false)
+            await service.setAccountRateLimited(accountId, false)
             return false
           }
 
@@ -868,7 +1038,7 @@ class UnifiedOpenAIScheduler {
         throw error
       }
 
-      // 获取可用的分组成员账户（支持 OpenAI 和 OpenAI-Responses 两种类型）
+      // 获取可用的分组成员账户（支持 OpenAI、OpenAI-Responses 和 Grok 三种类型）
       const availableAccounts = []
       for (const memberId of memberIds) {
         // 首先尝试从 OpenAI 账户服务获取
@@ -881,13 +1051,28 @@ class UnifiedOpenAIScheduler {
           accountType = 'openai-responses'
         }
 
+        // 如果都不存在，尝试从 Grok 账户服务获取
+        if (!account) {
+          account = await grokAccountService.getAccount(memberId)
+          accountType = 'grok'
+        }
+
         if (
           account &&
           (account.isActive === true || account.isActive === 'true') &&
           account.status !== 'error'
         ) {
+          // Grok 只服务于 grok 系列模型，OpenAI（ChatGPT/Codex）不服务于 grok 系列模型
+          if (!this._isAccountTypeCompatibleWithModel(accountType, requestedModel)) {
+            logger.debug(
+              `⏭️ Skipping group member ${accountType} account ${account.name} - requested model ${requestedModel || '(unspecified)'} is incompatible`
+            )
+            continue
+          }
+
           const readiness = await this._ensureAccountReadyForScheduling(account, account.id, {
-            sanitized: false
+            sanitized: false,
+            accountType
           })
 
           if (!readiness.canUse) {
@@ -914,7 +1099,7 @@ class UnifiedOpenAIScheduler {
             continue
           }
 
-          // 检查token是否过期（仅对 OpenAI OAuth 账户检查）
+          // 检查token是否过期并尽量自动刷新（OpenAI / Grok 两种 OAuth 账户）
           if (accountType === 'openai') {
             const isExpired = openaiAccountService.isTokenExpired(account)
             if (isExpired && !account.refreshToken) {
@@ -922,6 +1107,29 @@ class UnifiedOpenAIScheduler {
                 `⚠️ Group member OpenAI account ${account.name} token expired and no refresh token available`
               )
               continue
+            }
+          } else if (accountType === 'grok') {
+            const isExpired = grokAccountService.isTokenExpired(account)
+            if (isExpired) {
+              if (!account.refreshToken) {
+                logger.warn(
+                  `⚠️ Group member Grok account ${account.name} token expired and no refresh token available`
+                )
+                continue
+              }
+              try {
+                logger.info(
+                  `🔄 Auto-refreshing expired token for group member Grok account ${account.name}`
+                )
+                await grokAccountService.refreshAccountToken(account.id)
+                account = await grokAccountService.getAccount(account.id)
+              } catch (refreshError) {
+                logger.error(
+                  `❌ Failed to refresh token for group member Grok account ${account.name}:`,
+                  refreshError.message
+                )
+                continue
+              }
             }
           }
 
@@ -1000,6 +1208,11 @@ class UnifiedOpenAIScheduler {
     try {
       if (accountType === 'openai') {
         await openaiAccountService.recordUsage(accountId, 0)
+        return
+      }
+
+      if (accountType === 'grok') {
+        await grokAccountService.recordUsage(accountId, 0)
         return
       }
 

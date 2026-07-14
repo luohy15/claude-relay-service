@@ -53,6 +53,16 @@ jest.mock('../src/services/relay/openaiResponsesRelayService', () => ({
   handleRequest: jest.fn()
 }))
 
+jest.mock('../src/services/account/grokAccountService', () => ({
+  getAccount: jest.fn(),
+  isTokenExpired: jest.fn(() => false),
+  refreshAccountToken: jest.fn()
+}))
+
+jest.mock('../src/services/relay/grokRelayService', () => ({
+  handleRequest: jest.fn()
+}))
+
 jest.mock('../src/services/apiKeyService', () => ({
   hasPermission: jest.fn(() => true),
   recordUsage: jest.fn()

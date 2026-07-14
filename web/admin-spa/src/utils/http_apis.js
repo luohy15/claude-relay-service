@@ -190,6 +190,13 @@ export const createOpenAIResponsesAccountApi = (data) =>
 export const updateOpenAIResponsesAccountApi = (id, data) =>
   request({ url: `/admin/openai-responses-accounts/${id}`, method: 'PUT', data })
 
+// Grok（grok.com 订阅 OAuth）账户
+export const getGrokAccountsApi = () => request({ url: '/admin/grok-accounts', method: 'GET' })
+export const createGrokAccountApi = (data) =>
+  request({ url: '/admin/grok-accounts', method: 'POST', data })
+export const updateGrokAccountApi = (id, data) =>
+  request({ url: `/admin/grok-accounts/${id}`, method: 'PUT', data })
+
 // Azure OpenAI 账户
 export const getAzureOpenAIAccountsApi = () =>
   request({ url: '/admin/azure-openai-accounts', method: 'GET' })

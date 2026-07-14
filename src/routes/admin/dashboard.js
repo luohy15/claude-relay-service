@@ -7,6 +7,7 @@ const ccrAccountService = require('../../services/account/ccrAccountService')
 const geminiAccountService = require('../../services/account/geminiAccountService')
 const droidAccountService = require('../../services/account/droidAccountService')
 const openaiResponsesAccountService = require('../../services/account/openaiResponsesAccountService')
+const grokAccountService = require('../../services/account/grokAccountService')
 const redis = require('../../models/redis')
 const { authenticateAdmin } = require('../../middleware/auth')
 const logger = require('../../utils/logger')
@@ -36,6 +37,7 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
       openaiAccounts,
       ccrAccounts,
       openaiResponsesAccounts,
+      grokAccounts,
       droidAccounts,
       todayStats,
       systemAverages,
@@ -48,6 +50,7 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
       redis.getAllOpenAIAccounts(),
       ccrAccountService.getAllAccounts(),
       openaiResponsesAccountService.getAllAccounts(true),
+      grokAccountService.getAllAccounts(),
       droidAccountService.getAllAccounts(),
       redis.getTodayStats(),
       redis.getSystemAverages(),
@@ -185,6 +188,7 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
     const openaiStats = countAccountStats(openaiAccounts, { isStringType: true })
     const ccrStats = countAccountStats(ccrAccounts)
     const openaiResponsesStats = countAccountStats(openaiResponsesAccounts, { isStringType: true })
+    const grokStats = countAccountStats(grokAccounts, { isStringType: true })
 
     const dashboard = {
       overview: {
@@ -285,6 +289,13 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
             paused: openaiResponsesStats.paused,
             rateLimited: openaiResponsesStats.rateLimited
           },
+          grok: {
+            total: grokAccounts.length,
+            normal: grokStats.normal,
+            abnormal: grokStats.abnormal,
+            paused: grokStats.paused,
+            rateLimited: grokStats.rateLimited
+          },
           droid: {
             total: droidAccounts.length,
             normal: normalDroidAccounts,
@@ -301,6 +312,7 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
           bedrockStats.normal +
           openaiStats.normal +
           openaiResponsesStats.normal +
+          grokStats.normal +
           ccrStats.normal +
           normalDroidAccounts,
         totalClaudeAccounts: claudeAccounts.length + claudeConsoleAccounts.length,

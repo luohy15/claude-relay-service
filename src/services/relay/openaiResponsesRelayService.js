@@ -45,7 +45,12 @@ function extractCacheCreationTokens(usageData) {
 }
 
 class OpenAIResponsesRelayService {
-  constructor() {
+  // options.accountService: 账户存取服务（需暴露 getAccount/updateAccount/updateAccountUsage/updateUsageQuota）
+  // options.accountType: 记录到 usage/上游错误处理里的账户类型标识
+  // 默认绑定 openai-responses 账户服务，保持向后兼容；Grok 等复用方通过独立实例传入各自的账户服务
+  constructor(options = {}) {
+    this.accountService = options.accountService || openaiResponsesAccountService
+    this.accountType = options.accountType || 'openai-responses'
     this.defaultTimeout = config.requestTimeout || 600000
   }
 
@@ -59,7 +64,7 @@ class OpenAIResponsesRelayService {
     }
 
     lastUsedAtThrottle.set(accountId, now, LAST_USED_AT_THROTTLE_MS)
-    await openaiResponsesAccountService.updateAccount(accountId, {
+    await this.accountService.updateAccount(accountId, {
       lastUsedAt: new Date().toISOString()
     })
   }
@@ -75,7 +80,7 @@ class OpenAIResponsesRelayService {
 
     try {
       // 获取完整的账户信息（包含解密的 API Key）
-      const fullAccount = await openaiResponsesAccountService.getAccount(account.id)
+      const fullAccount = await this.accountService.getAccount(account.id)
       if (!fullAccount) {
         throw new Error('Account not found')
       }
@@ -126,6 +131,15 @@ class OpenAIResponsesRelayService {
         ...filterForOpenAI(req.headers),
         Authorization: `Bearer ${fullAccount.apiKey}`,
         'Content-Type': 'application/json'
+      }
+
+      // Grok（grok.com 订阅 OAuth）专属：cli-chat-proxy 的鉴权中间件要求这个头部才会
+      // 把 Bearer token 当作 CLI 会话 token 校验；grok-build 客户端本身不会带上这个头
+      // （客户端把自定义模型当作第三方 API Key 处理），需要由 relay 注入。
+      // 其余 x-grok-* / x-grok-model-override 等头部由 grok-build 客户端自行携带，
+      // 已通过上面的 filterForOpenAI 透传，无需在此重复处理。
+      if (this.accountType === 'grok') {
+        headers['X-XAI-Token-Auth'] = 'xai-grok-cli'
       }
 
       // 处理 User-Agent
@@ -193,7 +207,7 @@ class OpenAIResponsesRelayService {
           await upstreamErrorHelper
             .markTempUnavailable(
               account.id,
-              'openai-responses',
+              this.accountType,
               429,
               resetsInSeconds || upstreamErrorHelper.parseRetryAfter(response.headers)
             )
@@ -266,7 +280,7 @@ class OpenAIResponsesRelayService {
               account?.disableAutoProtection === true || account?.disableAutoProtection === 'true'
             if (!oaiAutoProtectionDisabled) {
               await upstreamErrorHelper
-                .markTempUnavailable(account.id, 'openai-responses', 401)
+                .markTempUnavailable(account.id, this.accountType, 401)
                 .catch(() => {})
             }
             if (sessionHash) {
@@ -312,7 +326,7 @@ class OpenAIResponsesRelayService {
             if (!oaiAutoProtectionDisabled) {
               await upstreamErrorHelper.markTempUnavailable(
                 account.id,
-                'openai-responses',
+                this.accountType,
                 response.status
               )
             }
@@ -376,7 +390,7 @@ class OpenAIResponsesRelayService {
             account?.disableAutoProtection === true || account?.disableAutoProtection === 'true'
           if (!oaiAutoProtectionDisabled) {
             await upstreamErrorHelper
-              .markTempUnavailable(account.id, 'openai-responses', 503)
+              .markTempUnavailable(account.id, this.accountType, 503)
               .catch(() => {})
           }
         }
@@ -424,7 +438,7 @@ class OpenAIResponsesRelayService {
               account?.disableAutoProtection === true || account?.disableAutoProtection === 'true'
             if (!oaiAutoProtectionDisabled) {
               await upstreamErrorHelper
-                .markTempUnavailable(account.id, 'openai-responses', 401)
+                .markTempUnavailable(account.id, this.accountType, 401)
                 .catch(() => {})
             }
             if (sessionHash) {
@@ -652,7 +666,7 @@ class OpenAIResponsesRelayService {
             cacheReadTokens,
             modelToRecord,
             account.id,
-            'openai-responses',
+            this.accountType,
             serviceTier,
             createRequestDetailMeta(req, {
               requestBody: req.body,
@@ -666,7 +680,7 @@ class OpenAIResponsesRelayService {
           )
 
           // 更新账户的 token 使用统计
-          await openaiResponsesAccountService.updateAccountUsage(account.id, totalTokens)
+          await this.accountService.updateAccountUsage(account.id, totalTokens)
 
           // 更新账户使用额度（如果设置了额度限制）
           if (parseFloat(account.dailyQuota) > 0) {
@@ -682,7 +696,7 @@ class OpenAIResponsesRelayService {
               modelToRecord,
               serviceTier
             )
-            await openaiResponsesAccountService.updateUsageQuota(account.id, costInfo.costs.total)
+            await this.accountService.updateUsageQuota(account.id, costInfo.costs.total)
           }
         } catch (error) {
           logger.error('Failed to record usage:', error)
@@ -699,7 +713,7 @@ class OpenAIResponsesRelayService {
 
         await unifiedOpenAIScheduler.markAccountRateLimited(
           account.id,
-          'openai-responses',
+          this.accountType,
           sessionHash,
           rateLimitResetsInSeconds
         )
@@ -789,7 +803,7 @@ class OpenAIResponsesRelayService {
           cacheReadTokens,
           actualModel,
           account.id,
-          'openai-responses',
+          this.accountType,
           serviceTier,
           createRequestDetailMeta(req, {
             requestBody: req?.body,
@@ -803,7 +817,7 @@ class OpenAIResponsesRelayService {
         )
 
         // 更新账户的 token 使用统计
-        await openaiResponsesAccountService.updateAccountUsage(account.id, totalTokens)
+        await this.accountService.updateAccountUsage(account.id, totalTokens)
 
         // 更新账户使用额度（如果设置了额度限制）
         if (parseFloat(account.dailyQuota) > 0) {
@@ -819,7 +833,7 @@ class OpenAIResponsesRelayService {
             actualModel,
             serviceTier
           )
-          await openaiResponsesAccountService.updateUsageQuota(account.id, costInfo.costs.total)
+          await this.accountService.updateUsageQuota(account.id, costInfo.costs.total)
         }
       } catch (error) {
         logger.error('Failed to record usage:', error)
@@ -923,7 +937,7 @@ class OpenAIResponsesRelayService {
     // 使用统一调度器标记账户为限流状态（与普通OpenAI账号保持一致）
     await unifiedOpenAIScheduler.markAccountRateLimited(
       account.id,
-      'openai-responses',
+      this.accountType,
       sessionHash,
       resetsInSeconds
     )
@@ -974,3 +988,5 @@ class OpenAIResponsesRelayService {
 }
 
 module.exports = new OpenAIResponsesRelayService()
+// 暴露类本身，供 grokRelayService 等复用方以不同的 accountService/accountType 创建独立实例
+module.exports.OpenAIResponsesRelayService = OpenAIResponsesRelayService

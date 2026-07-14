@@ -2210,7 +2210,8 @@ const serviceRates = ref({
     droid: 1.0,
     bedrock: 1.0,
     azure: 1.0,
-    ccr: 1.0
+    ccr: 1.0,
+    grok: 1.0
   },
   updatedAt: null,
   updatedBy: null
@@ -2649,7 +2650,8 @@ const getServiceIcon = (service) => {
     droid: 'fas fa-android',
     bedrock: 'fab fa-aws',
     azure: 'fab fa-microsoft',
-    ccr: 'fas fa-server'
+    ccr: 'fas fa-server',
+    grok: 'fas fa-bolt'
   }
   return icons[service] || 'fas fa-cog'
 }
@@ -2662,7 +2664,8 @@ const getServiceIconClass = (service) => {
     droid: 'bg-gradient-to-br from-green-600 to-lime-600',
     bedrock: 'bg-gradient-to-br from-yellow-500 to-orange-600',
     azure: 'bg-gradient-to-br from-blue-600 to-cyan-600',
-    ccr: 'bg-gradient-to-br from-purple-500 to-pink-600'
+    ccr: 'bg-gradient-to-br from-purple-500 to-pink-600',
+    grok: 'bg-gradient-to-br from-amber-500 to-orange-600'
   }
   return classes[service] || 'bg-gradient-to-br from-gray-500 to-gray-600'
 }
@@ -2675,7 +2678,8 @@ const getServiceName = (service) => {
     droid: 'Droid',
     bedrock: 'AWS Bedrock',
     azure: 'Azure OpenAI',
-    ccr: 'CCR'
+    ccr: 'CCR',
+    grok: 'Grok'
   }
   return names[service] || service
 }

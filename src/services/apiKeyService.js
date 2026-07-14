@@ -14,6 +14,7 @@ const ACCOUNT_TYPE_CONFIG = {
   'claude-console': { prefix: 'claude_console_account:' },
   openai: { prefix: 'openai:account:' },
   'openai-responses': { prefix: 'openai_responses_account:' },
+  grok: { prefix: 'grok:account:' },
   'azure-openai': { prefix: 'azure_openai:account:' },
   gemini: { prefix: 'gemini_account:' },
   'gemini-api': { prefix: 'gemini_api_account:' },
@@ -23,6 +24,7 @@ const ACCOUNT_TYPE_CONFIG = {
 const ACCOUNT_TYPE_PRIORITY = [
   'openai',
   'openai-responses',
+  'grok',
   'azure-openai',
   'claude',
   'claude-console',
@@ -36,6 +38,7 @@ const ACCOUNT_CATEGORY_MAP = {
   'claude-console': 'claude',
   openai: 'openai',
   'openai-responses': 'openai',
+  grok: 'openai',
   'azure-openai': 'openai',
   gemini: 'gemini',
   'gemini-api': 'gemini',
@@ -120,6 +123,9 @@ function sanitizeAccountIdForType(accountId, accountType) {
   }
   if (accountType === 'openai-responses') {
     return accountId.replace(/^responses:/, '')
+  }
+  if (accountType === 'grok') {
+    return accountId.replace(/^grok:/, '')
   }
   if (accountType === 'gemini-api') {
     return accountId.replace(/^api:/, '')
@@ -2227,6 +2233,9 @@ class ApiKeyService {
       if (typeof rawAccountId === 'string' && rawAccountId.startsWith('responses:')) {
         candidateIds.add(rawAccountId.replace(/^responses:/, ''))
       }
+      if (typeof rawAccountId === 'string' && rawAccountId.startsWith('grok:')) {
+        candidateIds.add(rawAccountId.replace(/^grok:/, ''))
+      }
       if (typeof rawAccountId === 'string' && rawAccountId.startsWith('api:')) {
         candidateIds.add(rawAccountId.replace(/^api:/, ''))
       }
@@ -2252,6 +2261,8 @@ class ApiKeyService {
         pushType('openai')
         pushType('openai-responses')
         pushType('azure-openai')
+      } else if (lowerModel.includes('grok')) {
+        pushType('grok')
       } else if (lowerModel.includes('gemini')) {
         pushType('gemini')
         pushType('gemini-api')
@@ -2611,6 +2622,7 @@ class ApiKeyService {
         'gemini-api': 'geminiAccountId', // 特殊处理，带 api: 前缀
         openai: 'openaiAccountId',
         'openai-responses': 'openaiAccountId', // 特殊处理，带 responses: 前缀
+        grok: 'openaiAccountId', // 特殊处理，带 grok: 前缀
         azure_openai: 'azureOpenaiAccountId',
         bedrock: 'bedrockAccountId',
         droid: 'droidAccountId',
@@ -2631,6 +2643,9 @@ class ApiKeyService {
       if (accountType === 'openai-responses') {
         // OpenAI-Responses 特殊处理：查找 openaiAccountId 字段中带 responses: 前缀的
         boundKeys = allKeys.filter((key) => key.openaiAccountId === `responses:${accountId}`)
+      } else if (accountType === 'grok') {
+        // Grok 特殊处理：查找 openaiAccountId 字段中带 grok: 前缀的
+        boundKeys = allKeys.filter((key) => key.openaiAccountId === `grok:${accountId}`)
       } else if (accountType === 'gemini-api') {
         // Gemini-API 特殊处理：查找 geminiAccountId 字段中带 api: 前缀的
         boundKeys = allKeys.filter((key) => key.geminiAccountId === `api:${accountId}`)
@@ -2643,6 +2658,8 @@ class ApiKeyService {
       for (const key of boundKeys) {
         const updates = {}
         if (accountType === 'openai-responses') {
+          updates.openaiAccountId = null
+        } else if (accountType === 'grok') {
           updates.openaiAccountId = null
         } else if (accountType === 'gemini-api') {
           updates.geminiAccountId = null

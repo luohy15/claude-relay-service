@@ -2188,6 +2188,8 @@ class RedisClient {
       accountData = await this.client.hgetall(`openai:account:${accountId}`)
     } else if (accountType === 'openai-responses') {
       accountData = await this.client.hgetall(`openai_responses_account:${accountId}`)
+    } else if (accountType === 'grok') {
+      accountData = await this.client.hgetall(`grok:account:${accountId}`)
     } else {
       // 尝试多个前缀（优先 claude:account:）
       accountData = await this.client.hgetall(`claude:account:${accountId}`)

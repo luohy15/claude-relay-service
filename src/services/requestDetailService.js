@@ -8,6 +8,7 @@ const geminiAccountService = require('./account/geminiAccountService')
 const geminiApiAccountService = require('./account/geminiApiAccountService')
 const openaiAccountService = require('./account/openaiAccountService')
 const openaiResponsesAccountService = require('./account/openaiResponsesAccountService')
+const grokAccountService = require('./account/grokAccountService')
 const azureOpenaiAccountService = require('./account/azureOpenaiAccountService')
 const droidAccountService = require('./account/droidAccountService')
 const bedrockAccountService = require('./account/bedrockAccountService')
@@ -38,6 +39,7 @@ const accountTypeNames = {
   ccr: 'Claude Console Relay',
   openai: 'OpenAI',
   'openai-responses': 'OpenAI Responses',
+  grok: 'Grok',
   'azure-openai': 'Azure OpenAI',
   gemini: 'Gemini',
   'gemini-api': 'Gemini API',
@@ -52,6 +54,7 @@ const accountServices = {
   ccr: ccrAccountService,
   openai: openaiAccountService,
   'openai-responses': openaiResponsesAccountService,
+  grok: grokAccountService,
   'azure-openai': azureOpenaiAccountService,
   gemini: geminiAccountService,
   'gemini-api': geminiApiAccountService,

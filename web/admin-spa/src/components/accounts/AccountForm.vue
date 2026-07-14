@@ -414,6 +414,34 @@
                       <label
                         class="group relative flex cursor-pointer items-center rounded-md border p-2 transition-all"
                         :class="[
+                          form.platform === 'grok'
+                            ? 'border-amber-500 bg-amber-50 dark:border-amber-400 dark:bg-amber-900/30'
+                            : 'border-gray-300 bg-white hover:border-amber-400 hover:bg-amber-50/50 dark:border-gray-600 dark:bg-gray-700 dark:hover:border-amber-500 dark:hover:bg-amber-900/20'
+                        ]"
+                      >
+                        <input v-model="form.platform" class="sr-only" type="radio" value="grok" />
+                        <div class="flex items-center gap-2">
+                          <i class="fas fa-bolt text-sm text-amber-600 dark:text-amber-400"></i>
+                          <div>
+                            <span class="block text-xs font-medium text-gray-900 dark:text-gray-100"
+                              >Grok Build</span
+                            >
+                            <span class="text-xs text-gray-500 dark:text-gray-400"
+                              >grok.com 订阅</span
+                            >
+                          </div>
+                        </div>
+                        <div
+                          v-if="form.platform === 'grok'"
+                          class="absolute right-1 top-1 flex h-4 w-4 items-center justify-center rounded-full bg-amber-500"
+                        >
+                          <i class="fas fa-check text-xs text-white"></i>
+                        </div>
+                      </label>
+
+                      <label
+                        class="group relative flex cursor-pointer items-center rounded-md border p-2 transition-all"
+                        :class="[
                           form.platform === 'azure_openai'
                             ? 'border-blue-500 bg-blue-50 dark:border-blue-400 dark:bg-blue-900/30'
                             : 'border-gray-300 bg-white hover:border-blue-400 hover:bg-blue-50/50 dark:border-gray-600 dark:bg-gray-700 dark:hover:border-blue-500 dark:hover:bg-blue-900/20'
@@ -581,6 +609,7 @@
                 form.platform !== 'bedrock' &&
                 form.platform !== 'azure_openai' &&
                 form.platform !== 'openai-responses' &&
+                form.platform !== 'grok' &&
                 form.platform !== 'gemini-api'
               "
             >
@@ -1720,6 +1749,58 @@
               <input v-model.number="form.rateLimitDuration" type="hidden" value="60" />
             </div>
 
+            <!-- Grok（grok.com 订阅 OAuth）特定字段 -->
+            <div v-if="form.platform === 'grok' && !isEdit" class="space-y-4">
+              <div
+                class="mb-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-900/30 dark:text-amber-200"
+              >
+                <i class="fas fa-info-circle mr-1" />
+                请在已登录 grok CLI（<code>grok login</code>）的机器上，从
+                <code class="rounded bg-amber-100 px-1 py-0.5 font-mono dark:bg-amber-900/50"
+                  >~/.grok/auth.json</code
+                >
+                复制 <code>key</code>（Access Token）与 <code>refresh_token</code> 字段填入下方。
+              </div>
+
+              <div>
+                <label class="mb-3 block text-sm font-semibold text-gray-700 dark:text-gray-300"
+                  >Access Token (可选)</label
+                >
+                <textarea
+                  v-model="form.accessToken"
+                  class="form-input w-full resize-none border-gray-300 font-mono text-xs dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200 dark:placeholder-gray-400"
+                  placeholder="可选：如果不填写，系统会自动通过 Refresh Token 获取..."
+                  rows="4"
+                />
+                <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                  <i class="fas fa-info-circle mr-1" />
+                  Access Token 可选填（约 6 小时有效期）。如果不提供，系统会通过 Refresh Token
+                  自动获取。
+                </p>
+              </div>
+
+              <div>
+                <label class="mb-3 block text-sm font-semibold text-gray-700 dark:text-gray-300"
+                  >Refresh Token *</label
+                >
+                <textarea
+                  v-model="form.refreshToken"
+                  class="form-input w-full resize-none border-gray-300 font-mono text-xs dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200 dark:placeholder-gray-400"
+                  :class="{ 'border-red-500': errors.refreshToken }"
+                  placeholder="请输入 Refresh Token（必填）..."
+                  required
+                  rows="4"
+                />
+                <p v-if="errors.refreshToken" class="mt-1 text-xs text-red-500">
+                  {{ errors.refreshToken }}
+                </p>
+                <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                  <i class="fas fa-info-circle mr-1" />
+                  系统将使用 Refresh Token 通过 auth.x.ai 自动获取 Access Token 并保持刷新
+                </p>
+              </div>
+            </div>
+
             <!-- Gemini API 配置 -->
             <div v-if="form.platform === 'gemini-api' && !isEdit" class="space-y-4">
               <div>
@@ -2007,7 +2088,8 @@
                 form.platform !== 'ccr' &&
                 form.platform !== 'bedrock' &&
                 form.platform !== 'azure_openai' &&
-                form.platform !== 'openai-responses'
+                form.platform !== 'openai-responses' &&
+                form.platform !== 'grok'
               "
               class="space-y-4 rounded-lg border border-blue-200 bg-blue-50 p-4"
             >
@@ -3537,6 +3619,36 @@
             </div>
           </div>
 
+          <!-- Grok（grok.com 订阅 OAuth）特定字段（编辑模式）-->
+          <div v-if="form.platform === 'grok'" class="space-y-4">
+            <div>
+              <label class="mb-3 block text-sm font-semibold text-gray-700 dark:text-gray-300"
+                >Access Token</label
+              >
+              <textarea
+                v-model="form.accessToken"
+                class="form-input w-full resize-none font-mono text-xs"
+                placeholder="留空表示不更新"
+                rows="3"
+              />
+            </div>
+            <div>
+              <label class="mb-3 block text-sm font-semibold text-gray-700 dark:text-gray-300"
+                >Refresh Token</label
+              >
+              <textarea
+                v-model="form.refreshToken"
+                class="form-input w-full resize-none font-mono text-xs"
+                placeholder="留空表示不更新"
+                rows="3"
+              />
+              <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                留空表示不更新 Token；如果 grok.com 会话已失效，请从
+                <code>~/.grok/auth.json</code> 复制最新的 refresh_token
+              </p>
+            </div>
+          </div>
+
           <!-- Gemini API 特定字段（编辑模式）-->
           <div v-if="form.platform === 'gemini-api'" class="space-y-4">
             <div>
@@ -3925,7 +4037,8 @@
               form.platform !== 'ccr' &&
               form.platform !== 'bedrock' &&
               form.platform !== 'azure_openai' &&
-              form.platform !== 'openai-responses'
+              form.platform !== 'openai-responses' &&
+              form.platform !== 'grok'
             "
             class="rounded-lg border border-amber-200 bg-amber-50 p-4 dark:border-amber-700 dark:bg-amber-900/30"
           >
@@ -4102,7 +4215,8 @@ const autoProtectionPlatforms = [
   'gemini',
   'gemini-api',
   'openai',
-  'openai-responses'
+  'openai-responses',
+  'grok'
 ]
 
 // OAuthFlow 组件引用
@@ -4153,7 +4267,7 @@ const showApiKeyManagement = ref(false)
 const determinePlatformGroup = (platform) => {
   if (['claude', 'claude-console', 'ccr', 'bedrock'].includes(platform)) {
     return 'claude'
-  } else if (['openai', 'openai-responses', 'azure_openai'].includes(platform)) {
+  } else if (['openai', 'openai-responses', 'grok', 'azure_openai'].includes(platform)) {
     return 'openai'
   } else if (['gemini', 'gemini-antigravity', 'gemini-api'].includes(platform)) {
     return 'gemini'
@@ -5318,6 +5432,13 @@ const createAccount = async () => {
         hasError = true
       }
       // Access Token 可选，如果没有会通过 Refresh Token 获取
+    } else if (form.value.platform === 'grok') {
+      // Grok 平台必须有 Refresh Token
+      if (!form.value.refreshToken || form.value.refreshToken.trim() === '') {
+        errors.value.refreshToken = '请填写 Refresh Token'
+        hasError = true
+      }
+      // Access Token 可选，如果没有会通过 Refresh Token 获取
     } else if (form.value.platform === 'gemini') {
       // Gemini 平台需要 Access Token
       if (!form.value.accessToken || form.value.accessToken.trim() === '') {
@@ -5527,6 +5648,22 @@ const createAccount = async () => {
       data.rateLimitDuration = 60 // 默认值60，不从用户输入获取
       data.dailyQuota = form.value.dailyQuota || 0
       data.quotaResetTime = form.value.quotaResetTime || '00:00'
+    } else if (form.value.platform === 'grok') {
+      // Grok（grok.com 订阅 OAuth）手动模式需要构建 grokOauth 对象
+      const expiresInMs = form.value.refreshToken
+        ? 6 * 60 * 60 * 1000 // 6小时（grok.com OIDC access token 典型有效期）
+        : 365 * 24 * 60 * 60 * 1000 // 1年
+
+      data.grokOauth = {
+        accessToken: form.value.accessToken || '', // Access Token 可选
+        refreshToken: form.value.refreshToken, // Refresh Token 必填
+        expires_in: Math.floor(expiresInMs / 1000)
+      }
+
+      // Grok 手动模式需要刷新以验证 Refresh Token 是否有效
+      data.needsImmediateRefresh = true
+      data.requireRefreshSuccess = true
+      data.priority = form.value.priority || 50
     } else if (form.value.platform === 'gemini-antigravity') {
       // Antigravity OAuth - set oauthProvider, submission happens below
       data.oauthProvider = 'antigravity'
@@ -5590,6 +5727,8 @@ const createAccount = async () => {
       result = await accountsStore.createDroidAccount(data)
     } else if (form.value.platform === 'openai-responses') {
       result = await accountsStore.createOpenAIResponsesAccount(data)
+    } else if (form.value.platform === 'grok') {
+      result = await accountsStore.createGrokAccount(data)
     } else if (form.value.platform === 'bedrock') {
       result = await accountsStore.createBedrockAccount(data)
     } else if (form.value.platform === 'openai') {
@@ -5881,6 +6020,21 @@ const updateAccount = async () => {
       data.quotaResetTime = form.value.quotaResetTime || '00:00'
     }
 
+    // Grok（grok.com 订阅 OAuth）特定更新
+    if (props.account.platform === 'grok') {
+      data.priority = form.value.priority || 50
+      const grokOauth = {}
+      if (form.value.accessToken && form.value.accessToken.trim()) {
+        grokOauth.accessToken = form.value.accessToken.trim()
+      }
+      if (form.value.refreshToken && form.value.refreshToken.trim()) {
+        grokOauth.refreshToken = form.value.refreshToken.trim()
+      }
+      if (Object.keys(grokOauth).length > 0) {
+        data.grokOauth = grokOauth
+      }
+    }
+
     // Bedrock 特定更新
     if (props.account.platform === 'bedrock') {
       // 更新凭证类型
@@ -5960,6 +6114,8 @@ const updateAccount = async () => {
       await accountsStore.updateClaudeConsoleAccount(props.account.id, data)
     } else if (props.account.platform === 'openai-responses') {
       await accountsStore.updateOpenAIResponsesAccount(props.account.id, data)
+    } else if (props.account.platform === 'grok') {
+      await accountsStore.updateGrokAccount(props.account.id, data)
     } else if (props.account.platform === 'bedrock') {
       await accountsStore.updateBedrockAccount(props.account.id, data)
     } else if (props.account.platform === 'openai') {
@@ -6087,8 +6243,8 @@ const filteredGroups = computed(() => {
   if (form.value.platform === 'claude-console' || form.value.platform === 'ccr') {
     platformFilter = 'claude'
   }
-  // OpenAI-Responses 使用 OpenAI 分组
-  else if (form.value.platform === 'openai-responses') {
+  // OpenAI-Responses / Grok 使用 OpenAI 分组
+  else if (form.value.platform === 'openai-responses' || form.value.platform === 'grok') {
     platformFilter = 'openai'
   }
   // Gemini-API 使用 Gemini 分组
@@ -6161,9 +6317,10 @@ watch(
       newPlatform === 'claude-console' ||
       newPlatform === 'ccr' ||
       newPlatform === 'bedrock' ||
-      newPlatform === 'openai-responses'
+      newPlatform === 'openai-responses' ||
+      newPlatform === 'grok'
     ) {
-      form.value.addType = 'manual' // Claude Console、CCR、Bedrock 和 OpenAI-Responses 只支持手动模式
+      form.value.addType = 'manual' // Claude Console、CCR、Bedrock、OpenAI-Responses 和 Grok 只支持手动模式
     } else if (newPlatform === 'claude') {
       // 切换到 Claude 时，使用 oauth 作为默认方式
       form.value.addType = 'oauth'
