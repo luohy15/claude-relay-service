@@ -326,6 +326,12 @@ const handleResponses = async (req, res) => {
     const compactRoute = isCompactResponsesRoute(req)
     const shouldUseToggleControlledFlow = standardResponsesRoute && !compactRoute
 
+    // 在任何请求体调整之前记录调用方是否显式提供了 service_tier，供后续直连 ChatGPT 分支的默认值决策使用
+    const callerProvidedServiceTier = standardResponsesRoute
+      ? Object.prototype.hasOwnProperty.call(req.body || {}, 'service_tier')
+      : false
+    const callerServiceTierValue = callerProvidedServiceTier ? req.body.service_tier : null
+
     if (shouldUseToggleControlledFlow) {
       const shouldApplyCodexAdaptation =
         apiKeyData.enableOpenAIResponsesCodexAdaptation === true && !isCodexCLI
@@ -395,6 +401,21 @@ const handleResponses = async (req, res) => {
     if (accountType === 'openai-responses') {
       logger.info(`🔀 Using OpenAI-Responses relay service for account: ${account.name}`)
       return await openaiResponsesRelayService.handleRequest(req, res, account, apiKeyData)
+    }
+
+    // 直连 ChatGPT 订阅账户的标准 Responses 请求默认使用 fast service_tier，
+    // 优先保留 API Key payload rule 或调用方显式提供的值
+    if (standardResponsesRoute) {
+      const hasResolvedServiceTier = Object.prototype.hasOwnProperty.call(
+        req.body || {},
+        'service_tier'
+      )
+
+      if (!hasResolvedServiceTier) {
+        req.body.service_tier = callerProvidedServiceTier ? callerServiceTierValue : 'fast'
+      }
+
+      req._serviceTier = req.body.service_tier || null
     }
 
     if (schedulerModel !== requestedModel) {
