@@ -7,7 +7,9 @@ const { authenticateApiKey } = require('../middleware/auth')
 const unifiedOpenAIScheduler = require('../services/scheduler/unifiedOpenAIScheduler')
 const openaiAccountService = require('../services/account/openaiAccountService')
 const openaiResponsesAccountService = require('../services/account/openaiResponsesAccountService')
+const grokAccountService = require('../services/account/grokAccountService')
 const openaiResponsesRelayService = require('../services/relay/openaiResponsesRelayService')
+const grokRelayService = require('../services/relay/grokRelayService')
 const apiKeyService = require('../services/apiKeyService')
 const redis = require('../models/redis')
 const crypto = require('crypto')
@@ -222,6 +224,52 @@ async function getOpenAIAuthToken(apiKeyData, sessionId = null, requestedModel =
       }
 
       logger.info(`Selected OpenAI-Responses account: ${account.name} (${result.accountId})`)
+    } else if (result.accountType === 'grok') {
+      // 处理 Grok（grok.com 订阅 OAuth）账户
+      account = await grokAccountService.getAccount(result.accountId)
+      if (!account || !account.accessToken) {
+        const error = new Error(`Grok account ${result.accountId} has no valid accessToken`)
+        error.statusCode = 403 // Forbidden - 账户配置错误
+        throw error
+      }
+
+      // 检查 token 是否过期并自动刷新（双重保护，调度器选中时已尽量刷新过一次）
+      if (grokAccountService.isTokenExpired(account)) {
+        if (account.refreshToken) {
+          logger.info(
+            `🔄 Token expired, auto-refreshing for Grok account ${account.name} (fallback)`
+          )
+          try {
+            await grokAccountService.refreshAccountToken(result.accountId)
+            account = await grokAccountService.getAccount(result.accountId)
+            logger.info(`✅ Grok token refreshed successfully in route handler`)
+          } catch (refreshError) {
+            logger.error(`Failed to refresh Grok token for ${account.name}:`, refreshError)
+            const error = new Error(`Token expired and refresh failed: ${refreshError.message}`)
+            error.statusCode = 403 // Forbidden - 认证失败
+            throw error
+          }
+        } else {
+          const error = new Error(
+            `Token expired and no refresh token available for account ${account.name}`
+          )
+          error.statusCode = 403 // Forbidden - 认证失败
+          throw error
+        }
+      }
+
+      // Grok 账户由 grokRelayService（复用 openai-responses 协议）转发，不需要在此拼装 accessToken
+      accessToken = null
+
+      if (account.proxy) {
+        try {
+          proxy = typeof account.proxy === 'string' ? JSON.parse(account.proxy) : account.proxy
+        } catch (e) {
+          logger.warn('Failed to parse proxy configuration:', e)
+        }
+      }
+
+      logger.info(`Selected Grok account: ${account.name} (${result.accountId})`)
     } else {
       // 处理普通 OpenAI 账户
       account = await openaiAccountService.getAccount(result.accountId)
@@ -401,6 +449,12 @@ const handleResponses = async (req, res) => {
     if (accountType === 'openai-responses') {
       logger.info(`🔀 Using OpenAI-Responses relay service for account: ${account.name}`)
       return await openaiResponsesRelayService.handleRequest(req, res, account, apiKeyData)
+    }
+
+    // 如果是 Grok（grok.com 订阅 OAuth）账户，复用 openai-responses 协议的中继服务
+    if (accountType === 'grok') {
+      logger.info(`🔀 Using Grok relay service for account: ${account.name}`)
+      return await grokRelayService.handleRequest(req, res, account, apiKeyData)
     }
 
     // 直连 ChatGPT 订阅账户的标准 Responses 请求默认使用 priority service_tier，

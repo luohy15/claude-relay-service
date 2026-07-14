@@ -62,6 +62,7 @@ class AccountNameCacheService {
       // 可选服务（可能不存在）
       let geminiApiAccountService = null
       let openaiResponsesAccountService = null
+      let grokAccountService = null
       try {
         geminiApiAccountService = require('./account/geminiApiAccountService')
       } catch (e) {
@@ -69,6 +70,11 @@ class AccountNameCacheService {
       }
       try {
         openaiResponsesAccountService = require('./account/openaiResponsesAccountService')
+      } catch (e) {
+        // 服务不存在，忽略
+      }
+      try {
+        grokAccountService = require('./account/grokAccountService')
       } catch (e) {
         // 服务不存在，忽略
       }
@@ -85,7 +91,8 @@ class AccountNameCacheService {
         bedrockAccountService.getAllAccounts(),
         droidAccountService.getAllAccounts(),
         ccrAccountService.getAllAccounts(),
-        accountGroupService.getAllGroups()
+        accountGroupService.getAllGroups(),
+        grokAccountService?.getAllAccounts() || Promise.resolve([])
       ])
 
       // 提取结果
@@ -100,6 +107,7 @@ class AccountNameCacheService {
       const droidAccounts = results[8].status === 'fulfilled' ? results[8].value : []
       const ccrAccounts = results[9].status === 'fulfilled' ? results[9].value : []
       const groups = results[10].status === 'fulfilled' ? results[10].value : []
+      const grokAccounts = results[11].status === 'fulfilled' ? results[11].value : []
 
       // Bedrock 返回格式特殊处理
       const bedrockAccounts = Array.isArray(bedrockResult)
@@ -129,6 +137,7 @@ class AccountNameCacheService {
       addAccounts(geminiApiAccounts, 'gemini-api', 'api:')
       addAccounts(openaiAccounts, 'openai')
       addAccounts(openaiResponsesAccounts, 'openai-responses', 'responses:')
+      addAccounts(grokAccounts, 'grok', 'grok:')
       addAccounts(azureOpenaiAccounts, 'azure-openai')
       addAccounts(bedrockAccounts, 'bedrock')
       addAccounts(droidAccounts, 'droid')

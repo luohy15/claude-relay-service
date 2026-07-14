@@ -7,6 +7,7 @@ const geminiAccountService = require('../../services/account/geminiAccountServic
 const geminiApiAccountService = require('../../services/account/geminiApiAccountService')
 const openaiAccountService = require('../../services/account/openaiAccountService')
 const openaiResponsesAccountService = require('../../services/account/openaiResponsesAccountService')
+const grokAccountService = require('../../services/account/grokAccountService')
 const droidAccountService = require('../../services/account/droidAccountService')
 const bedrockAccountService = require('../../services/account/bedrockAccountService')
 const redis = require('../../models/redis')
@@ -110,6 +111,7 @@ const accountTypeNames = {
   ccr: 'Claude Console Relay',
   openai: 'OpenAI',
   'openai-responses': 'OpenAI Responses',
+  grok: 'Grok',
   gemini: 'Gemini',
   'gemini-api': 'Gemini API',
   droid: 'Droid',
@@ -125,6 +127,7 @@ const resolveAccountByPlatform = async (accountId, platform) => {
     'gemini-api': geminiApiAccountService,
     openai: openaiAccountService,
     'openai-responses': openaiResponsesAccountService,
+    grok: grokAccountService,
     droid: droidAccountService,
     ccr: ccrAccountService,
     bedrock: bedrockAccountService
@@ -249,6 +252,7 @@ router.get('/accounts/:accountId/usage-history', authenticateAdmin, async (req, 
       'claude-console',
       'openai',
       'openai-responses',
+      'grok',
       'gemini',
       'gemini-api',
       'droid',
@@ -264,6 +268,7 @@ router.get('/accounts/:accountId/usage-history', authenticateAdmin, async (req, 
     const accountTypeMap = {
       openai: 'openai',
       'openai-responses': 'openai-responses',
+      grok: 'grok',
       'gemini-api': 'gemini-api',
       droid: 'droid',
       bedrock: 'bedrock'
@@ -274,6 +279,7 @@ router.get('/accounts/:accountId/usage-history', authenticateAdmin, async (req, 
       'claude-console': 'claude-3-5-sonnet-20241022',
       openai: 'gpt-4o-mini-2024-07-18',
       'openai-responses': 'gpt-4o-mini-2024-07-18',
+      grok: 'grok-4.5-build',
       gemini: 'gemini-1.5-flash',
       'gemini-api': 'gemini-2.0-flash',
       droid: 'unknown',
@@ -297,6 +303,9 @@ router.get('/accounts/:accountId/usage-history', authenticateAdmin, async (req, 
           break
         case 'openai-responses':
           accountData = await openaiResponsesAccountService.getAccount(accountId)
+          break
+        case 'grok':
+          accountData = await grokAccountService.getAccount(accountId)
           break
         case 'gemini':
           accountData = await geminiAccountService.getAccount(accountId)
@@ -1280,9 +1289,10 @@ router.get('/account-usage-trend', authenticateAdmin, async (req, res) => {
         })
       ]
     } else if (group === 'openai') {
-      const [openaiAccounts, openaiResponsesAccounts] = await Promise.all([
+      const [openaiAccounts, openaiResponsesAccounts, grokAccounts] = await Promise.all([
         openaiAccountService.getAllAccounts(),
-        openaiResponsesAccountService.getAllAccounts(true)
+        openaiResponsesAccountService.getAllAccounts(true),
+        grokAccountService.getAllAccounts()
       ])
 
       accounts = [
@@ -1302,6 +1312,15 @@ router.get('/account-usage-trend', authenticateAdmin, async (req, res) => {
             id,
             name: account.name || `Responses账号 ${shortId}`,
             platform: 'openai-responses'
+          }
+        }),
+        ...grokAccounts.map((account) => {
+          const id = String(account.id || '')
+          const shortId = id ? id.slice(0, 8) : '未知'
+          return {
+            id,
+            name: account.name || `Grok账号 ${shortId}`,
+            platform: 'grok'
           }
         })
       ]
@@ -2726,6 +2745,7 @@ router.get('/api-keys/:keyId/usage-records', authenticateAdmin, async (req, res)
       { type: 'ccr', getter: (id) => ccrAccountService.getAccount(id) },
       { type: 'openai', getter: (id) => openaiAccountService.getAccount(id) },
       { type: 'openai-responses', getter: (id) => openaiResponsesAccountService.getAccount(id) },
+      { type: 'grok', getter: (id) => grokAccountService.getAccount(id) },
       { type: 'gemini', getter: (id) => geminiAccountService.getAccount(id) },
       { type: 'gemini-api', getter: (id) => geminiApiAccountService.getAccount(id) },
       { type: 'droid', getter: (id) => droidAccountService.getAccount(id) }

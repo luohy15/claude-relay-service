@@ -621,6 +621,19 @@
                       >
                     </div>
                     <div
+                      v-else-if="account.platform === 'grok'"
+                      class="flex items-center gap-1.5 rounded-lg border border-amber-200 bg-gradient-to-r from-amber-100 to-orange-100 px-2.5 py-1 dark:border-amber-700 dark:from-amber-900/20 dark:to-orange-900/20"
+                    >
+                      <i class="fas fa-bolt text-xs text-amber-700 dark:text-amber-400" />
+                      <span class="text-xs font-semibold text-amber-800 dark:text-amber-300"
+                        >Grok</span
+                      >
+                      <span class="mx-1 h-4 w-px bg-amber-300 dark:bg-amber-600" />
+                      <span class="text-xs font-medium text-amber-700 dark:text-amber-400"
+                        >OAuth</span
+                      >
+                    </div>
+                    <div
                       v-else-if="
                         account.platform === 'claude' || account.platform === 'claude-oauth'
                       "
@@ -1232,6 +1245,7 @@
                       account.platform === 'gemini' ||
                       account.platform === 'openai' ||
                       account.platform === 'openai-responses' ||
+                      account.platform === 'grok' ||
                       account.platform === 'azure_openai' ||
                       account.platform === 'ccr' ||
                       account.platform === 'droid' ||
@@ -2350,6 +2364,7 @@ const TEMP_UNAVAILABLE_ACCOUNT_TYPE_ALIASES = {
   'gemini-api': ['gemini-api'],
   openai: ['openai'],
   'openai-responses': ['openai-responses'],
+  grok: ['grok'],
   ccr: ['ccr'],
   droid: ['droid'],
   azure_openai: ['azure-openai'],
@@ -2396,6 +2411,7 @@ const supportedUsagePlatforms = [
   'claude-console',
   'openai',
   'openai-responses',
+  'grok',
   'gemini',
   'droid',
   'gemini-api',
@@ -2461,6 +2477,7 @@ const platformHierarchy = [
     children: [
       { value: 'openai', label: 'OpenAI 官方', icon: 'fa-openai' },
       { value: 'openai-responses', label: 'OpenAI-Responses (Codex)', icon: 'fa-server' },
+      { value: 'grok', label: 'Grok Build (grok.com)', icon: 'fa-bolt' },
       { value: 'azure_openai', label: 'Azure OpenAI', icon: 'fab fa-microsoft' }
     ]
   },
@@ -2484,7 +2501,7 @@ const platformHierarchy = [
 // 平台分组映射
 const platformGroupMap = {
   'group-claude': ['claude', 'claude-console', 'bedrock', 'ccr'],
-  'group-openai': ['openai', 'openai-responses', 'azure_openai'],
+  'group-openai': ['openai', 'openai-responses', 'grok', 'azure_openai'],
   'group-gemini': ['gemini', 'gemini-api'],
   'group-droid': ['droid']
 }
@@ -2498,6 +2515,7 @@ const platformRequestHandlers = {
   openai: () => httpApis.getOpenAIAccountsApi(),
   azure_openai: () => httpApis.getAzureOpenAIAccountsApi(),
   'openai-responses': () => httpApis.getOpenAIResponsesAccountsApi(),
+  grok: () => httpApis.getGrokAccountsApi(),
   ccr: () => httpApis.getCcrAccountsApi(),
   droid: () => httpApis.getDroidAccountsApi(),
   'gemini-api': () => httpApis.getGeminiApiAccountsApi()
@@ -2634,6 +2652,7 @@ const showResetButton = (account) => {
     'claude-console',
     'openai',
     'openai-responses',
+    'grok',
     'gemini',
     'gemini-api',
     'ccr',
@@ -2940,6 +2959,7 @@ const accountStats = computed(() => {
     { value: 'azure_openai', label: 'Azure OpenAI' },
     { value: 'bedrock', label: 'Bedrock' },
     { value: 'openai-responses', label: 'OpenAI-Responses' },
+    { value: 'grok', label: 'Grok' },
     { value: 'ccr', label: 'CCR' },
     { value: 'droid', label: 'Droid' }
   ]
@@ -3352,6 +3372,7 @@ const loadAccounts = async (forceReload = false) => {
     const allAccounts = []
     const counts = bindingCounts.value || {}
     let openaiResponsesRaw = []
+    let grokRaw = []
 
     const appendAccounts = (platform, data) => {
       const list = Array.isArray(data) ? data : []
@@ -3407,6 +3428,10 @@ const loadAccounts = async (forceReload = false) => {
           openaiResponsesRaw = list
           break
         }
+        case 'grok': {
+          grokRaw = list
+          break
+        }
         case 'ccr': {
           const items = list.map((acc) => ({ ...acc, platform: 'ccr', boundApiKeysCount: 0 }))
           allAccounts.push(...items)
@@ -3446,6 +3471,15 @@ const loadAccounts = async (forceReload = false) => {
       })
 
       allAccounts.push(...responsesAccounts)
+    }
+
+    if (grokRaw.length > 0) {
+      const grokAccounts = grokRaw.map((acc) => {
+        const boundApiKeysCount = counts.openaiAccountId?.[`grok:${acc.id}`] || 0
+        return { ...acc, platform: 'grok', boundApiKeysCount }
+      })
+
+      allAccounts.push(...grokAccounts)
     }
 
     // 根据分组筛选器过滤账户
@@ -3966,6 +4000,7 @@ const getBoundApiKeysForAccount = (account) => {
       key.openaiAccountId === accountId ||
       key.azureOpenaiAccountId === accountId ||
       key.openaiAccountId === `responses:${accountId}` ||
+      key.openaiAccountId === `grok:${accountId}` ||
       key.geminiAccountId === `api:${accountId}`
     )
   })
@@ -3985,6 +4020,8 @@ const resolveAccountDeleteEndpoint = (account) => {
       return `/admin/azure-openai-accounts/${account.id}`
     case 'openai-responses':
       return `/admin/openai-responses-accounts/${account.id}`
+    case 'grok':
+      return `/admin/grok-accounts/${account.id}`
     case 'ccr':
       return `/admin/ccr-accounts/${account.id}`
     case 'gemini':
@@ -4133,6 +4170,7 @@ const batchDeleteAccounts = async () => {
 const RESET_STATUS_ENDPOINT_MAP = {
   openai: (id) => `/admin/openai-accounts/${id}/reset-status`,
   'openai-responses': (id) => `/admin/openai-responses-accounts/${id}/reset-status`,
+  grok: (id) => `/admin/grok-accounts/${id}/reset-status`,
   claude: (id) => `/admin/claude-accounts/${id}/reset-status`,
   'claude-console': (id) => `/admin/claude-console-accounts/${id}/reset-status`,
   ccr: (id) => `/admin/ccr-accounts/${id}/reset-status`,
@@ -4153,6 +4191,7 @@ const TOGGLE_SCHEDULABLE_ENDPOINT_MAP = {
   azure_openai: (id) => `/admin/azure-openai-accounts/${id}/toggle-schedulable`,
   'azure-openai': (id) => `/admin/azure-openai-accounts/${id}/toggle-schedulable`,
   'openai-responses': (id) => `/admin/openai-responses-accounts/${id}/toggle-schedulable`,
+  grok: (id) => `/admin/grok-accounts/${id}/toggle-schedulable`,
   ccr: (id) => `/admin/ccr-accounts/${id}/toggle-schedulable`,
   droid: (id) => `/admin/droid-accounts/${id}/toggle-schedulable`,
   'gemini-api': (id) => `/admin/gemini-api-accounts/${id}/toggle-schedulable`
@@ -4484,8 +4523,8 @@ const getSchedulableReason = (account) => {
     }
   }
 
-  // OpenAI-Responses 账户的错误状态
-  if (account.platform === 'openai-responses') {
+  // OpenAI-Responses / Grok 账户的错误状态
+  if (account.platform === 'openai-responses' || account.platform === 'grok') {
     if (account.status === 'unauthorized') {
       return '认证失败（401错误）'
     }
@@ -5202,6 +5241,9 @@ const handleSaveAccountExpiry = async ({ accountId, expiresAt }) => {
         break
       case 'openai-responses':
         endpoint = `/admin/openai-responses-accounts/${accountId}` // 使用 :id
+        break
+      case 'grok':
+        endpoint = `/admin/grok-accounts/${accountId}` // 使用 :id
         break
       default:
         showToast(`不支持的平台类型: ${account.platform}`, 'error')

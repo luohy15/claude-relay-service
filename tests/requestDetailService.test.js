@@ -24,6 +24,7 @@ jest.mock('../src/services/account/openaiAccountService', () => ({ getAccount: j
 jest.mock('../src/services/account/openaiResponsesAccountService', () => ({
   getAccount: jest.fn()
 }))
+jest.mock('../src/services/account/grokAccountService', () => ({ getAccount: jest.fn() }))
 jest.mock('../src/services/account/azureOpenaiAccountService', () => ({ getAccount: jest.fn() }))
 jest.mock('../src/services/account/droidAccountService', () => ({ getAccount: jest.fn() }))
 jest.mock('../src/services/account/bedrockAccountService', () => ({ getAccount: jest.fn() }))
