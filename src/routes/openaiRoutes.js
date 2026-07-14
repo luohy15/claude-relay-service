@@ -403,7 +403,7 @@ const handleResponses = async (req, res) => {
       return await openaiResponsesRelayService.handleRequest(req, res, account, apiKeyData)
     }
 
-    // 直连 ChatGPT 订阅账户的标准 Responses 请求默认使用 fast service_tier，
+    // 直连 ChatGPT 订阅账户的标准 Responses 请求默认使用 priority service_tier，
     // 优先保留 API Key payload rule 或调用方显式提供的值
     if (standardResponsesRoute) {
       const hasResolvedServiceTier = Object.prototype.hasOwnProperty.call(
@@ -412,7 +412,7 @@ const handleResponses = async (req, res) => {
       )
 
       if (!hasResolvedServiceTier) {
-        req.body.service_tier = callerProvidedServiceTier ? callerServiceTierValue : 'fast'
+        req.body.service_tier = callerProvidedServiceTier ? callerServiceTierValue : 'priority'
       }
 
       req._serviceTier = req.body.service_tier || null
