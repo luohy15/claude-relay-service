@@ -487,7 +487,7 @@ describe('openai responses payload toggles', () => {
       body: {
         model: 'gpt-5-2025-08-07',
         temperature: 0.2,
-        service_tier: 'priority',
+        service_tier: 'default',
         prompt_cache_key: 'adapt-tier-key',
         stream: false
       }
@@ -495,14 +495,14 @@ describe('openai responses payload toggles', () => {
 
     await openaiRoutes.handleResponses(req, createRes())
 
-    expect(req.body.service_tier).toBe('priority')
-    expect(req._serviceTier).toBe('priority')
-    expect(axios.post.mock.calls[0][1]).toMatchObject({ service_tier: 'priority' })
+    expect(req.body.service_tier).toBe('default')
+    expect(req._serviceTier).toBe('default')
+    expect(axios.post.mock.calls[0][1]).toMatchObject({ service_tier: 'default' })
     expect(apiKeyService.recordUsage).toHaveBeenCalled()
-    expect(apiKeyService.recordUsage.mock.calls[0][8]).toBe('priority')
+    expect(apiKeyService.recordUsage.mock.calls[0][8]).toBe('default')
   })
 
-  test('defaults standard responses to the fast service_tier for openai accounts when no tier is provided', async () => {
+  test('defaults standard responses to the priority service_tier for openai accounts when no tier is provided', async () => {
     unifiedOpenAIScheduler.selectAccountForApiKey.mockResolvedValue({
       accountId: 'openai-1',
       accountType: 'openai'
@@ -541,9 +541,9 @@ describe('openai responses payload toggles', () => {
 
     await openaiRoutes.handleResponses(req, createRes())
 
-    expect(req._serviceTier).toBe('fast')
-    expect(axios.post.mock.calls[0][1]).toMatchObject({ service_tier: 'fast' })
-    expect(apiKeyService.recordUsage.mock.calls[0][8]).toBe('fast')
+    expect(req._serviceTier).toBe('priority')
+    expect(axios.post.mock.calls[0][1]).toMatchObject({ service_tier: 'priority' })
+    expect(apiKeyService.recordUsage.mock.calls[0][8]).toBe('priority')
   })
 
   test('does not default service_tier for openai-responses accounts when no tier is provided', async () => {
