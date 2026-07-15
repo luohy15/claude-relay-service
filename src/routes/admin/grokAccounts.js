@@ -19,6 +19,8 @@ const { createOpenAITestPayload, extractErrorMessage } = require('../../utils/te
 const ProxyHelper = require('../../utils/proxyHelper')
 
 const router = express.Router()
+const GROK_CLI_CLIENT_VERSION = '0.2.101'
+const GROK_CLI_CLIENT_IDENTIFIER = 'grok-shell'
 
 // 获取所有 Grok 账户
 router.get('/', authenticateAdmin, async (req, res) => {
@@ -462,7 +464,10 @@ router.post('/:accountId/test', authenticateAdmin, async (req, res) => {
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${account.apiKey}`,
-        'X-XAI-Token-Auth': 'xai-grok-cli'
+        'X-XAI-Token-Auth': 'xai-grok-cli',
+        'x-grok-client-version': GROK_CLI_CLIENT_VERSION,
+        'x-grok-client-identifier': GROK_CLI_CLIENT_IDENTIFIER,
+        'x-grok-model-override': model
       },
       timeout: 30000
     }

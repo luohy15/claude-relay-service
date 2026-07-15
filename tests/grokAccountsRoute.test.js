@@ -232,7 +232,7 @@ describe('admin grok accounts route - connectivity test endpoint', () => {
     axios.post.mockReset()
   })
 
-  it('sends the request with both auth headers and never leaks token material', async () => {
+  it('sends the Grok CLI compatibility headers and never leaks token material', async () => {
     const handler = findHandler('post', '/:accountId/test')
 
     grokAccountService.getAccount.mockResolvedValue({
@@ -251,8 +251,14 @@ describe('admin grok accounts route - connectivity test endpoint', () => {
     expect(axios.post).toHaveBeenCalledTimes(1)
     const [url, , requestConfig] = axios.post.mock.calls[0]
     expect(url).toBe('https://cli-chat-proxy.grok.com/v1/responses')
-    expect(requestConfig.headers.Authorization).toBe('Bearer plaintext-access-token')
-    expect(requestConfig.headers['X-XAI-Token-Auth']).toBe('xai-grok-cli')
+    expect(requestConfig.headers).toEqual({
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer plaintext-access-token',
+      'X-XAI-Token-Auth': 'xai-grok-cli',
+      'x-grok-client-version': '0.2.101',
+      'x-grok-client-identifier': 'grok-shell',
+      'x-grok-model-override': 'grok-4.5-build'
+    })
 
     expect(res.body.success).toBe(true)
     expect(res.body.data.responseText).toBe('pong')
