@@ -439,7 +439,9 @@ router.put('/:id/toggle', authenticateAdmin, async (req, res) => {
 // 测试 Grok 账户连通性
 router.post('/:accountId/test', authenticateAdmin, async (req, res) => {
   const { accountId } = req.params
-  const { model = 'grok-4.5-build' } = req.body
+  // grok-4.5 is the default: verified accessible to subscription accounts, unlike
+  // grok-4.5-build which requires separate team entitlement.
+  const { model = 'grok-4.5' } = req.body
   const startTime = Date.now()
 
   try {

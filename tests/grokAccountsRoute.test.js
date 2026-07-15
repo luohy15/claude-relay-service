@@ -257,7 +257,7 @@ describe('admin grok accounts route - connectivity test endpoint', () => {
       'X-XAI-Token-Auth': 'xai-grok-cli',
       'x-grok-client-version': '0.2.101',
       'x-grok-client-identifier': 'grok-shell',
-      'x-grok-model-override': 'grok-4.5-build'
+      'x-grok-model-override': 'grok-4.5'
     })
 
     expect(res.body.success).toBe(true)
@@ -266,6 +266,49 @@ describe('admin grok accounts route - connectivity test endpoint', () => {
       expect(res.body.data).not.toHaveProperty(field)
     }
     expect(JSON.stringify(res.body)).not.toContain('plaintext-access-token')
+  })
+
+  it('defaults the test model to grok-4.5 (verified subscription-compatible) not grok-4.5-build', async () => {
+    const handler = findHandler('post', '/:accountId/test')
+
+    grokAccountService.getAccount.mockResolvedValue({
+      id: 'grok-4b',
+      name: 'Grok Account 4b',
+      apiKey: 'plaintext-access-token',
+      baseApi: 'https://cli-chat-proxy.grok.com/v1'
+    })
+    axios.post.mockResolvedValue({
+      data: { output: [{ type: 'message', content: [{ type: 'output_text', text: 'pong' }] }] }
+    })
+
+    const res = createResponse()
+    await handler({ params: { accountId: 'grok-4b' }, body: {} }, res)
+
+    const [, payload, requestConfig] = axios.post.mock.calls[0]
+    expect(payload.model).toBe('grok-4.5')
+    expect(requestConfig.headers['x-grok-model-override']).toBe('grok-4.5')
+    expect(res.body.data.model).toBe('grok-4.5')
+  })
+
+  it('still allows an explicitly requested model to override the default', async () => {
+    const handler = findHandler('post', '/:accountId/test')
+
+    grokAccountService.getAccount.mockResolvedValue({
+      id: 'grok-4c',
+      name: 'Grok Account 4c',
+      apiKey: 'plaintext-access-token',
+      baseApi: 'https://cli-chat-proxy.grok.com/v1'
+    })
+    axios.post.mockResolvedValue({
+      data: { output: [{ type: 'message', content: [{ type: 'output_text', text: 'pong' }] }] }
+    })
+
+    const res = createResponse()
+    await handler({ params: { accountId: 'grok-4c' }, body: { model: 'grok-4.5-build' } }, res)
+
+    const [, , requestConfig] = axios.post.mock.calls[0]
+    expect(requestConfig.headers['x-grok-model-override']).toBe('grok-4.5-build')
+    expect(res.body.data.model).toBe('grok-4.5-build')
   })
 
   it('refreshes the token first when the access token is expired', async () => {
