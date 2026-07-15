@@ -337,7 +337,7 @@ const platformFallbackModels = {
   'openai-responses': 'gpt-5',
   droid: 'claude-sonnet-4-5-20250929',
   ccr: 'claude-sonnet-4-5-20250929',
-  grok: 'grok-4.5-build'
+  grok: 'grok-4.5'
 }
 
 const defaultModel = computed(() => {

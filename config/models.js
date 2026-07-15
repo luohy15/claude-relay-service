@@ -41,8 +41,10 @@ const OPENAI_MODELS = [
 ]
 
 const GROK_MODELS = [
-  { value: 'grok-4.5-build', label: 'Grok 4.5 (Build)' },
+  // grok-4.5 listed first so manual-test/account defaults land on the model verified
+  // accessible to subscription accounts; grok-4.5-build remains selectable below.
   { value: 'grok-4.5', label: 'Grok 4.5' },
+  { value: 'grok-4.5-build', label: 'Grok 4.5 (Build)' },
   { value: 'grok-composer-2.5-fast-build', label: 'Grok Composer 2.5 Fast (Build)' },
   { value: 'grok-composer-2.5-fast', label: 'Grok Composer 2.5 Fast' }
 ]
