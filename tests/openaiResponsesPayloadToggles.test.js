@@ -112,6 +112,8 @@ const apiKeyService = require('../src/services/apiKeyService')
 const openaiAccountService = require('../src/services/account/openaiAccountService')
 const openaiResponsesAccountService = require('../src/services/account/openaiResponsesAccountService')
 const openaiResponsesRelayService = require('../src/services/relay/openaiResponsesRelayService')
+const grokAccountService = require('../src/services/account/grokAccountService')
+const grokRelayService = require('../src/services/relay/grokRelayService')
 const openaiRoutes = require('../src/routes/openaiRoutes')
 
 function createHash(value) {
@@ -573,6 +575,39 @@ describe('openai responses payload toggles', () => {
 
     expect(openaiResponsesRelayService.handleRequest).toHaveBeenCalled()
     const relayedReq = openaiResponsesRelayService.handleRequest.mock.calls[0][0]
+    expect(relayedReq.body.service_tier).toBeUndefined()
+    expect(relayedReq._serviceTier).toBeNull()
+  })
+
+  test('routes grok accounts to grokRelayService and does not default service_tier', async () => {
+    unifiedOpenAIScheduler.selectAccountForApiKey.mockResolvedValue({
+      accountId: 'grok-1',
+      accountType: 'grok'
+    })
+    grokAccountService.getAccount.mockResolvedValue({
+      id: 'grok-1',
+      name: 'Grok Account',
+      accessToken: 'encrypted-grok-token'
+    })
+    grokRelayService.handleRequest.mockResolvedValue({ ok: true })
+
+    const req = createReq({
+      path: '/v1/responses',
+      body: {
+        model: 'grok-4.5-build',
+        prompt_cache_key: 'no-default-grok-key'
+      },
+      apiKeyOverrides: {
+        enableOpenAIResponsesCodexAdaptation: false,
+        enableOpenAIResponsesPayloadRules: false
+      }
+    })
+
+    await openaiRoutes.handleResponses(req, createRes())
+
+    expect(grokRelayService.handleRequest).toHaveBeenCalled()
+    expect(openaiResponsesRelayService.handleRequest).not.toHaveBeenCalled()
+    const relayedReq = grokRelayService.handleRequest.mock.calls[0][0]
     expect(relayedReq.body.service_tier).toBeUndefined()
     expect(relayedReq._serviceTier).toBeNull()
   })
