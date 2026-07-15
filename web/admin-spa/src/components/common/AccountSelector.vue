@@ -241,6 +241,45 @@
               </div>
             </div>
 
+            <!-- Grok 专属账号（仅 OpenAI） -->
+            <div v-if="platform === 'openai' && filteredGrokAccounts.length > 0">
+              <div
+                class="bg-gray-50 px-4 py-2 text-xs font-semibold text-gray-500 dark:bg-gray-700 dark:text-gray-400"
+              >
+                Grok 专属账号
+              </div>
+              <div
+                v-for="account in filteredGrokAccounts"
+                :key="account.id"
+                class="cursor-pointer px-4 py-2 transition-colors hover:bg-gray-50 dark:hover:bg-gray-700"
+                :class="{
+                  'bg-blue-50 dark:bg-blue-900/20': modelValue === `grok:${account.id}`
+                }"
+                @click="selectAccount(`grok:${account.id}`)"
+              >
+                <div class="flex items-center justify-between">
+                  <div>
+                    <span class="text-gray-700 dark:text-gray-300">{{ account.name }}</span>
+                    <span
+                      class="ml-2 rounded-full px-2 py-0.5 text-xs"
+                      :class="
+                        account.isActive === 'true' || account.isActive === true
+                          ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
+                          : account.status === 'rate_limited'
+                            ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400'
+                            : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
+                      "
+                    >
+                      {{ getAccountStatusText(account) }}
+                    </span>
+                  </div>
+                  <span class="text-xs text-gray-400 dark:text-gray-500">
+                    {{ formatDate(account.createdAt) }}
+                  </span>
+                </div>
+              </div>
+            </div>
+
             <!-- Gemini-API 账号（仅 Gemini） -->
             <div v-if="platform === 'gemini' && filteredGeminiApiAccounts.length > 0">
               <div
@@ -380,6 +419,13 @@ const selectedLabel = computed(() => {
     const account = props.accounts.find(
       (a) => a.id === accountId && a.platform === 'openai-responses'
     )
+    return account ? `${account.name} (${getAccountStatusText(account)})` : ''
+  }
+
+  // Grok（grok.com 订阅 OAuth）账号
+  if (props.modelValue.startsWith('grok:')) {
+    const accountId = props.modelValue.substring(5)
+    const account = props.accounts.find((a) => a.id === accountId && a.platform === 'grok')
     return account ? `${account.name} (${getAccountStatusText(account)})` : ''
   }
 
@@ -531,6 +577,20 @@ const filteredGeminiApiAccounts = computed(() => {
   return accounts
 })
 
+// 过滤的 Grok（grok.com 订阅 OAuth）账号
+const filteredGrokAccounts = computed(() => {
+  if (props.platform !== 'openai') return []
+
+  let accounts = sortedAccounts.value.filter((a) => a.platform === 'grok')
+
+  if (searchQuery.value) {
+    const query = searchQuery.value.toLowerCase()
+    accounts = accounts.filter((account) => account.name.toLowerCase().includes(query))
+  }
+
+  return accounts
+})
+
 // 是否有搜索结果
 const hasResults = computed(() => {
   return (
@@ -538,7 +598,8 @@ const hasResults = computed(() => {
     filteredOAuthAccounts.value.length > 0 ||
     filteredConsoleAccounts.value.length > 0 ||
     filteredOpenAIResponsesAccounts.value.length > 0 ||
-    filteredGeminiApiAccounts.value.length > 0
+    filteredGeminiApiAccounts.value.length > 0 ||
+    filteredGrokAccounts.value.length > 0
   )
 })
 

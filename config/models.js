@@ -40,6 +40,13 @@ const OPENAI_MODELS = [
   { value: 'codex-mini', label: 'Codex Mini' }
 ]
 
+const GROK_MODELS = [
+  { value: 'grok-4.5-build', label: 'Grok 4.5 (Build)' },
+  { value: 'grok-4.5', label: 'Grok 4.5' },
+  { value: 'grok-composer-2.5-fast-build', label: 'Grok Composer 2.5 Fast (Build)' },
+  { value: 'grok-composer-2.5-fast', label: 'Grok Composer 2.5 Fast' }
+]
+
 const BEDROCK_MODELS = [
   { value: 'us.anthropic.claude-opus-4-6-20250610-v1:0', label: 'Claude Opus 4.6' },
   { value: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0', label: 'Claude Sonnet 4.5' },
@@ -65,7 +72,8 @@ const PLATFORM_TEST_MODELS = {
   'openai-responses': OPENAI_MODELS,
   'azure-openai': [],
   droid: CLAUDE_MODELS,
-  ccr: CLAUDE_MODELS
+  ccr: CLAUDE_MODELS,
+  grok: GROK_MODELS
 }
 
 module.exports = {
@@ -73,6 +81,7 @@ module.exports = {
   GEMINI_MODELS,
   OPENAI_MODELS,
   BEDROCK_MODELS,
+  GROK_MODELS,
   OTHER_MODELS,
   PLATFORM_TEST_MODELS,
   // 按服务分组

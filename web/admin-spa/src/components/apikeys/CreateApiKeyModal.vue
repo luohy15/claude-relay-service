@@ -1153,6 +1153,14 @@ onMounted(async () => {
         })
       })
     }
+    if (props.accounts.grok) {
+      props.accounts.grok.forEach((account) => {
+        openaiAccounts.push({
+          ...account,
+          platform: account.platform || 'grok'
+        })
+      })
+    }
 
     localAccounts.value = {
       claude: props.accounts.claude || [],
@@ -1184,6 +1192,7 @@ const refreshAccounts = async () => {
       geminiApiData,
       openaiData,
       openaiResponsesData,
+      grokData,
       bedrockData,
       droidData,
       groupsData
@@ -1194,6 +1203,7 @@ const refreshAccounts = async () => {
       httpApis.getGeminiApiAccountsApi(), // 获取 Gemini-API 账号
       httpApis.getOpenAIAccountsApi(),
       httpApis.getOpenAIResponsesAccountsApi(), // 获取 OpenAI-Responses 账号
+      httpApis.getGrokAccountsApi(), // 获取 Grok（grok.com 订阅 OAuth）账号
       httpApis.getBedrockAccountsApi(),
       httpApis.getDroidAccountsApi(),
       httpApis.getAccountGroupsApi()
@@ -1267,6 +1277,16 @@ const refreshAccounts = async () => {
         openaiAccounts.push({
           ...account,
           platform: 'openai-responses',
+          isDedicated: account.accountType === 'dedicated' // 保留以便向后兼容
+        })
+      })
+    }
+
+    if (grokData.success) {
+      ;(grokData.data || []).forEach((account) => {
+        openaiAccounts.push({
+          ...account,
+          platform: 'grok',
           isDedicated: account.accountType === 'dedicated' // 保留以便向后兼容
         })
       })

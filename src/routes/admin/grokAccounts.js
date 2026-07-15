@@ -6,6 +6,7 @@
  */
 
 const express = require('express')
+const axios = require('axios')
 const grokAccountService = require('../../services/account/grokAccountService')
 const accountGroupService = require('../../services/accountGroupService')
 const apiKeyService = require('../../services/apiKeyService')
@@ -14,6 +15,8 @@ const { authenticateAdmin } = require('../../middleware/auth')
 const logger = require('../../utils/logger')
 const webhookNotifier = require('../../utils/webhookNotifier')
 const { formatAccountExpiry, mapExpiryField } = require('./utils')
+const { createOpenAITestPayload, extractErrorMessage } = require('../../utils/testPayloadHelper')
+const ProxyHelper = require('../../utils/proxyHelper')
 
 const router = express.Router()
 
@@ -427,6 +430,92 @@ router.put('/:id/toggle', authenticateAdmin, async (req, res) => {
       success: false,
       message: '切换账户状态失败',
       error: error.message
+    })
+  }
+})
+
+// 测试 Grok 账户连通性
+router.post('/:accountId/test', authenticateAdmin, async (req, res) => {
+  const { accountId } = req.params
+  const { model = 'grok-4.5-build' } = req.body
+  const startTime = Date.now()
+
+  try {
+    let account = await grokAccountService.getAccount(accountId)
+    if (!account) {
+      return res.status(404).json({ error: 'Account not found' })
+    }
+
+    if (grokAccountService.isTokenExpired(account)) {
+      await grokAccountService.refreshAccountToken(accountId)
+      account = await grokAccountService.getAccount(accountId)
+    }
+
+    if (!account.apiKey) {
+      return res.status(401).json({ error: 'Access Token not found or decryption failed' })
+    }
+
+    const apiUrl = `${account.baseApi}/responses`
+    const payload = createOpenAITestPayload(model, { stream: false })
+
+    const requestConfig = {
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${account.apiKey}`,
+        'X-XAI-Token-Auth': 'xai-grok-cli'
+      },
+      timeout: 30000
+    }
+
+    if (account.proxy) {
+      const agent = ProxyHelper.createProxyAgent(account.proxy)
+      if (agent) {
+        requestConfig.httpsAgent = agent
+        requestConfig.httpAgent = agent
+      }
+    }
+
+    const response = await axios.post(apiUrl, payload, requestConfig)
+    const latency = Date.now() - startTime
+
+    // 提取响应文本（Responses API 格式）
+    let responseText = ''
+    const output = response.data?.output
+    if (Array.isArray(output)) {
+      for (const item of output) {
+        if (item.type === 'message' && Array.isArray(item.content)) {
+          for (const block of item.content) {
+            if (block.type === 'output_text' && block.text) {
+              responseText += block.text
+            }
+          }
+        }
+      }
+    }
+
+    logger.success(
+      `✅ Grok account test passed: ${account.name} (${accountId}), latency: ${latency}ms`
+    )
+
+    return res.json({
+      success: true,
+      data: {
+        accountId,
+        accountName: account.name,
+        model,
+        latency,
+        responseText: responseText.substring(0, 200)
+      }
+    })
+  } catch (error) {
+    const latency = Date.now() - startTime
+    logger.error(`❌ Grok account test failed: ${accountId}`, error.message)
+
+    return res.status(500).json({
+      success: false,
+      error: 'Test failed',
+      message: extractErrorMessage(error.response?.data, error.message),
+      latency
     })
   }
 })
