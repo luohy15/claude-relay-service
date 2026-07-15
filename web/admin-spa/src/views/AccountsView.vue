@@ -2772,7 +2772,8 @@ const supportedTestPlatforms = [
   'openai-responses',
   'azure-openai',
   'droid',
-  'ccr'
+  'ccr',
+  'grok'
 ]
 
 const canTestAccount = (account) => {

@@ -2273,6 +2273,7 @@ const accounts = ref({
   geminiApi: [], // 添加 Gemini-API 账号列表（用于传递给子组件初始化）
   openai: [],
   openaiResponses: [], // 添加 OpenAI-Responses 账号列表
+  grok: [], // 添加 Grok（grok.com 订阅 OAuth）账号列表
   bedrock: [],
   droid: [],
   claudeGroups: [],
@@ -2477,6 +2478,7 @@ const loadAccounts = async (forceRefresh = false) => {
       geminiApiData,
       openaiData,
       openaiResponsesData,
+      grokData,
       bedrockData,
       droidData,
       groupsData
@@ -2487,6 +2489,7 @@ const loadAccounts = async (forceRefresh = false) => {
       httpApis.getGeminiApiAccountsApi(),
       httpApis.getOpenAIAccountsApi(),
       httpApis.getOpenAIResponsesAccountsApi(),
+      httpApis.getGrokAccountsApi(),
       httpApis.getBedrockAccountsApi(),
       httpApis.getDroidAccountsApi(),
       httpApis.getAccountGroupsApi()
@@ -2555,6 +2558,14 @@ const loadAccounts = async (forceRefresh = false) => {
     if (openaiResponsesData.success) {
       accounts.value.openaiResponses = (openaiResponsesData.data || []).map((account) => ({
         ...account,
+        isDedicated: account.accountType === 'dedicated'
+      }))
+    }
+
+    if (grokData.success) {
+      accounts.value.grok = (grokData.data || []).map((account) => ({
+        ...account,
+        platform: 'grok',
         isDedicated: account.accountType === 'dedicated'
       }))
     }
@@ -3045,6 +3056,17 @@ const getBoundAccountName = (accountId) => {
     return `${realAccountId.substring(0, 8)}`
   }
 
+  // 处理 grok: 前缀的 Grok（grok.com 订阅 OAuth）账户
+  if (accountId.startsWith('grok:')) {
+    const realAccountId = accountId.replace('grok:', '')
+    const grokAccount = accounts.value.grok.find((acc) => acc.id === realAccountId)
+    if (grokAccount) {
+      return `${grokAccount.name}`
+    }
+    // 如果找不到，返回ID的前8位
+    return `${realAccountId.substring(0, 8)}`
+  }
+
   // 从OpenAI账户列表中查找
   const openaiAccount = accounts.value.openai.find((acc) => acc.id === accountId)
   if (openaiAccount) {
@@ -3055,6 +3077,12 @@ const getBoundAccountName = (accountId) => {
   const openaiResponsesAccount = accounts.value.openaiResponses.find((acc) => acc.id === accountId)
   if (openaiResponsesAccount) {
     return `${openaiResponsesAccount.name}`
+  }
+
+  // 从 Grok 账户列表中查找（兼容没有前缀的情况）
+  const grokAccount = accounts.value.grok.find((acc) => acc.id === accountId)
+  if (grokAccount) {
+    return `${grokAccount.name}`
   }
 
   // 从Bedrock账户列表中查找
@@ -3157,11 +3185,14 @@ const getOpenAIBindingInfo = (key) => {
       return info
     }
 
-    // 处理 responses: 前缀的 OpenAI-Responses 账户
+    // 处理 responses: 前缀的 OpenAI-Responses 账户 / grok: 前缀的 Grok 账户
     let account = null
     if (key.openaiAccountId.startsWith('responses:')) {
       const realAccountId = key.openaiAccountId.replace('responses:', '')
       account = accounts.value.openaiResponses.find((acc) => acc.id === realAccountId)
+    } else if (key.openaiAccountId.startsWith('grok:')) {
+      const realAccountId = key.openaiAccountId.replace('grok:', '')
+      account = accounts.value.grok.find((acc) => acc.id === realAccountId)
     } else {
       // 查找普通 OpenAI 账户
       account = accounts.value.openai.find((acc) => acc.id === key.openaiAccountId)

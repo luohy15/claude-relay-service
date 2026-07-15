@@ -73,10 +73,14 @@ jest.mock('../src/services/account/grokAccountService', () => ({
   refreshAccountToken: jest.fn(),
   resetAccountStatus: jest.fn(),
   toggleSchedulable: jest.fn(),
+  isTokenExpired: jest.fn().mockReturnValue(false),
   sanitizeAccountForResponse: jest.requireActual('../src/services/account/grokAccountService')
     .sanitizeAccountForResponse
 }))
 
+jest.mock('axios')
+
+const axios = require('axios')
 const grokAccountService = require('../src/services/account/grokAccountService')
 require('../src/routes/admin/grokAccounts')
 
@@ -112,6 +116,8 @@ describe('admin grok accounts route - credential sanitization', () => {
     grokAccountService.updateAccount.mockReset()
     grokAccountService.refreshAccountToken.mockReset()
     grokAccountService.deleteAccount.mockReset()
+    grokAccountService.isTokenExpired.mockReset().mockReturnValue(false)
+    axios.post.mockReset()
   })
 
   it('does not leak decrypted tokens on create (immediate-refresh verification path)', async () => {
@@ -215,5 +221,96 @@ describe('admin grok accounts route - credential sanitization', () => {
     }
     expect(JSON.stringify(res.body)).not.toContain('plaintext-access-token-after-update')
     expect(JSON.stringify(res.body)).not.toContain('plaintext-refresh-token-after-update')
+  })
+})
+
+describe('admin grok accounts route - connectivity test endpoint', () => {
+  beforeEach(() => {
+    grokAccountService.getAccount.mockReset()
+    grokAccountService.refreshAccountToken.mockReset()
+    grokAccountService.isTokenExpired.mockReset().mockReturnValue(false)
+    axios.post.mockReset()
+  })
+
+  it('sends the request with both auth headers and never leaks token material', async () => {
+    const handler = findHandler('post', '/:accountId/test')
+
+    grokAccountService.getAccount.mockResolvedValue({
+      id: 'grok-4',
+      name: 'Grok Account 4',
+      apiKey: 'plaintext-access-token',
+      baseApi: 'https://cli-chat-proxy.grok.com/v1'
+    })
+    axios.post.mockResolvedValue({
+      data: { output: [{ type: 'message', content: [{ type: 'output_text', text: 'pong' }] }] }
+    })
+
+    const res = createResponse()
+    await handler({ params: { accountId: 'grok-4' }, body: {} }, res)
+
+    expect(axios.post).toHaveBeenCalledTimes(1)
+    const [url, , requestConfig] = axios.post.mock.calls[0]
+    expect(url).toBe('https://cli-chat-proxy.grok.com/v1/responses')
+    expect(requestConfig.headers.Authorization).toBe('Bearer plaintext-access-token')
+    expect(requestConfig.headers['X-XAI-Token-Auth']).toBe('xai-grok-cli')
+
+    expect(res.body.success).toBe(true)
+    expect(res.body.data.responseText).toBe('pong')
+    for (const field of CREDENTIAL_FIELDS) {
+      expect(res.body.data).not.toHaveProperty(field)
+    }
+    expect(JSON.stringify(res.body)).not.toContain('plaintext-access-token')
+  })
+
+  it('refreshes the token first when the access token is expired', async () => {
+    const handler = findHandler('post', '/:accountId/test')
+
+    grokAccountService.isTokenExpired.mockReturnValue(true)
+    grokAccountService.refreshAccountToken.mockResolvedValue({})
+    grokAccountService.getAccount
+      .mockResolvedValueOnce({
+        id: 'grok-5',
+        name: 'Grok Account 5',
+        apiKey: 'stale-access-token',
+        baseApi: 'https://cli-chat-proxy.grok.com/v1'
+      })
+      .mockResolvedValueOnce({
+        id: 'grok-5',
+        name: 'Grok Account 5',
+        apiKey: 'refreshed-access-token',
+        baseApi: 'https://cli-chat-proxy.grok.com/v1'
+      })
+    axios.post.mockResolvedValue({ data: { output: [] } })
+
+    const res = createResponse()
+    await handler({ params: { accountId: 'grok-5' }, body: {} }, res)
+
+    expect(grokAccountService.refreshAccountToken).toHaveBeenCalledWith('grok-5')
+    const [, , requestConfig] = axios.post.mock.calls[0]
+    expect(requestConfig.headers.Authorization).toBe('Bearer refreshed-access-token')
+    expect(res.body.success).toBe(true)
+  })
+
+  it('returns a sanitized error when the upstream request fails', async () => {
+    const handler = findHandler('post', '/:accountId/test')
+
+    grokAccountService.getAccount.mockResolvedValue({
+      id: 'grok-6',
+      name: 'Grok Account 6',
+      apiKey: 'plaintext-access-token',
+      baseApi: 'https://cli-chat-proxy.grok.com/v1'
+    })
+    axios.post.mockRejectedValue({
+      message: 'Request failed with status code 401',
+      response: { data: { error: { message: 'invalid token' } } }
+    })
+
+    const res = createResponse()
+    await handler({ params: { accountId: 'grok-6' }, body: {} }, res)
+
+    expect(res.statusCode).toBe(500)
+    expect(res.body.success).toBe(false)
+    expect(res.body.message).toBe('invalid token')
+    expect(JSON.stringify(res.body)).not.toContain('plaintext-access-token')
   })
 })

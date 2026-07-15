@@ -6,6 +6,12 @@ jest.mock('../src/utils/logger', () => ({
   error: jest.fn()
 }))
 
+jest.mock('../src/services/account/grokAccountService', () => ({
+  getAccount: jest.fn(),
+  getAllAccounts: jest.fn()
+}))
+
+const grokAccountService = require('../src/services/account/grokAccountService')
 const accountBalanceServiceModule = require('../src/services/account/accountBalanceService')
 
 const { AccountBalanceService } = accountBalanceServiceModule
@@ -187,6 +193,37 @@ describe('AccountBalanceService', () => {
     expect(result.data.source).toBe('api')
     expect(result.data.balance.amount).toBeCloseTo(3, 6)
     expect(result.data.lastRefreshAt).toBe('2025-01-01T00:00:00Z')
+  })
+
+  it('should include grok in supported platforms', () => {
+    const service = new AccountBalanceService({ redis: buildMockRedis(), logger: mockLogger })
+    expect(service.getSupportedPlatforms()).toContain('grok')
+  })
+
+  it('should resolve a grok account and return local statistics', async () => {
+    grokAccountService.getAccount.mockResolvedValue({ id: 'grok-acct-1', name: 'Grok 1' })
+
+    const mockRedis = buildMockRedis()
+    const service = new AccountBalanceService({ redis: mockRedis, logger: mockLogger })
+    service._computeMonthlyCost = jest.fn().mockResolvedValue(0)
+    service._computeTotalCost = jest.fn().mockResolvedValue(0)
+
+    const result = await service.getAccountBalance('grok-acct-1', 'grok', {})
+
+    expect(grokAccountService.getAccount).toHaveBeenCalledWith('grok-acct-1')
+    expect(result.success).toBe(true)
+    expect(result.data.platform).toBe('grok')
+    expect(result.data.source).toBe('local')
+  })
+
+  it('should list all grok accounts via getAllAccountsByPlatform', async () => {
+    grokAccountService.getAllAccounts.mockResolvedValue([{ id: 'grok-acct-2', name: 'Grok 2' }])
+
+    const service = new AccountBalanceService({ redis: buildMockRedis(), logger: mockLogger })
+    const accounts = await service.getAllAccountsByPlatform('grok')
+
+    expect(grokAccountService.getAllAccounts).toHaveBeenCalled()
+    expect(accounts).toEqual([{ id: 'grok-acct-2', name: 'Grok 2' }])
   })
 
   it('should count low balance once per account in summary', async () => {
