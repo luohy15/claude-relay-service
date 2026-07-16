@@ -9,7 +9,10 @@ const logger = require('../utils/logger')
 const geminiAccountService = require('../services/account/geminiAccountService')
 const geminiApiAccountService = require('../services/account/geminiApiAccountService')
 const { sendGeminiRequest, getAvailableModels } = require('../services/relay/geminiRelayService')
-const { sendAntigravityRequest } = require('../services/relay/antigravityRelayService')
+const {
+  sendAntigravityRequest,
+  streamGeneratorWithHeartbeat
+} = require('../services/relay/antigravityRelayService')
 const crypto = require('crypto')
 const sessionHelper = require('../utils/sessionHelper')
 const unifiedGeminiScheduler = require('../services/scheduler/unifiedGeminiScheduler')
@@ -752,12 +755,11 @@ async function handleMessages(req, res) {
         })
       } else {
         // OAuth 账户：使用原有的流式传输逻辑
-        for await (const chunk of geminiResponse) {
-          if (abortController.signal.aborted) {
-            break
-          }
-          res.write(chunk)
-        }
+        // 💓 通过共享心跳包裹逐块写入，覆盖上游 thinking 期间生成器长时间不 yield 的静默窗口，避免 CF 524
+        await streamGeneratorWithHeartbeat(geminiResponse, res, {
+          signal: abortController.signal,
+          label: `Gemini-OAuth:${accountId}`
+        })
         res.end()
       }
     } else {

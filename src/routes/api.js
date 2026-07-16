@@ -26,6 +26,7 @@ const {
 const { sanitizeUpstreamError } = require('../utils/errorSanitizer')
 const { dumpAnthropicMessagesRequest } = require('../utils/anthropicRequestDump')
 const { createRequestDetailMeta } = require('../utils/requestDetailHelper')
+const { attachHeartbeat } = require('../utils/sseHeartbeat')
 const {
   handleAnthropicMessagesToGemini,
   handleAnthropicCountTokensToGemini
@@ -295,6 +296,17 @@ async function handleMessagesRequest(req, res) {
       }
 
       // 流式响应不需要额外处理，中间件已经设置了监听器
+
+      // 💓 W1 修复：在联系上游前（会话绑定/账号调度/OAuth token 刷新/代理连接/上游 TTFB/529 重选
+      // 都可能累计 >120s）就启动 SSE 心跳，覆盖 pre-200 静默窗口，避免 Cloudflare 524。
+      // 只启动定时器、不主动 flush 头部，保持 fast-path 上错误状态码/重试逻辑（依赖 headersSent=false）
+      // 不变；若 pre-200 阶段真的静默 >15s，心跳才会写出首字节并提交头部。句柄传入各 relay，
+      // 由已有的 post-200 markData()/stop() 接管，避免重复启动第二个定时器。
+      const streamHeartbeat = attachHeartbeat(res, {
+        logger,
+        label: `Preflight:${req.apiKey?.name || 'unknown'}`
+      })
+      res.once('close', () => streamHeartbeat.stop())
 
       let usageDataCaptured = false
 
@@ -569,7 +581,9 @@ async function handleMessagesRequest(req, res) {
                 JSON.stringify(usageData)
               )
             }
-          }
+          },
+          null,
+          { heartbeat: streamHeartbeat }
         )
       } else if (accountType === 'claude-console') {
         // Claude Console账号使用Console转发服务（需要传递accountId）
@@ -706,7 +720,9 @@ async function handleMessagesRequest(req, res) {
               )
             }
           },
-          accountId
+          accountId,
+          null,
+          { heartbeat: streamHeartbeat }
         )
       } else if (accountType === 'bedrock') {
         // Bedrock账号使用Bedrock转发服务
@@ -725,7 +741,8 @@ async function handleMessagesRequest(req, res) {
             _requestBodyBedrock,
             bedrockAccountResult.data,
             res,
-            req
+            req,
+            streamHeartbeat
           )
 
           // 记录Bedrock使用统计
@@ -934,7 +951,9 @@ async function handleMessagesRequest(req, res) {
               )
             }
           },
-          accountId
+          accountId,
+          null,
+          { heartbeat: streamHeartbeat }
         )
       }
 

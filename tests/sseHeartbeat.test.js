@@ -66,6 +66,23 @@ describe('attachHeartbeat', () => {
     expect(res.write).toHaveBeenCalledTimes(1)
   })
 
+  it('is idempotent when stop() is called multiple times', () => {
+    // W1: the same handle is armed early (api.js) and handed into the relay, so
+    // stop() can fire from several exit paths (res 'close' + relay end/error/abort).
+    // Redundant stop() calls must be safe no-ops and never resurrect the timer.
+    const handle = attachHeartbeat(res, { interval: 1000 })
+
+    jest.advanceTimersByTime(1000)
+    expect(res.write).toHaveBeenCalledTimes(1)
+
+    handle.stop()
+    handle.stop()
+    handle.stop()
+
+    jest.advanceTimersByTime(5000)
+    expect(res.write).toHaveBeenCalledTimes(1)
+  })
+
   it('skips writes once the response is destroyed', () => {
     const handle = attachHeartbeat(res, { interval: 1000 })
 
