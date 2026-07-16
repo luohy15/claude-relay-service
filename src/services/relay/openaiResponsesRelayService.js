@@ -13,6 +13,7 @@ const {
   createRequestDetailMeta,
   extractOpenAICacheReadTokens
 } = require('../../utils/requestDetailHelper')
+const { attachHeartbeat } = require('../../utils/sseHeartbeat')
 
 // lastUsedAt 更新节流（每账户 60 秒内最多更新一次，使用 LRU 防止内存泄漏）
 const lastUsedAtThrottle = new LRUCache(1000) // 最多缓存 1000 个账户
@@ -502,6 +503,13 @@ class OpenAIResponsesRelayService {
     res.setHeader('Connection', 'keep-alive')
     res.setHeader('X-Accel-Buffering', 'no')
 
+    // 💓 上游 thinking 静默 >120s 会触发 CF 524，每 15s 在客户端连接上写入注释保活
+    const heartbeat = attachHeartbeat(res, {
+      logger,
+      label: `${this.accountType}:${account?.name || account?.id}`
+    })
+    const stopHeartbeat = () => heartbeat.stop()
+
     let usageData = null
     let actualModel = null
     let buffer = ''
@@ -574,6 +582,8 @@ class OpenAIResponsesRelayService {
         // 转发数据给客户端
         if (!res.destroyed && !streamEnded) {
           res.write(chunk)
+          // 💓 每次成功转发后重置心跳静默计时
+          heartbeat.markData()
         }
 
         // 同时解析数据以捕获 usage 信息
@@ -597,6 +607,8 @@ class OpenAIResponsesRelayService {
 
     response.data.on('end', async () => {
       streamEnded = true
+      // 💓 流正常结束，停止心跳
+      stopHeartbeat()
 
       // 处理剩余的 buffer
       if (buffer.trim()) {
@@ -703,6 +715,8 @@ class OpenAIResponsesRelayService {
 
     response.data.on('error', (error) => {
       streamEnded = true
+      // 💓 出错时停止心跳
+      stopHeartbeat()
       logger.error('Stream error:', error)
 
       // 清理监听器
@@ -719,6 +733,8 @@ class OpenAIResponsesRelayService {
     // 处理客户端断开连接
     const cleanup = () => {
       streamEnded = true
+      // 💓 客户端断开，停止心跳
+      stopHeartbeat()
       try {
         response.data?.unpipe?.(res)
         response.data?.destroy?.()

@@ -3,6 +3,7 @@ const ProxyHelper = require('../../utils/proxyHelper')
 const logger = require('../../utils/logger')
 const config = require('../../../config/config')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const { attachHeartbeat } = require('../../utils/sseHeartbeat')
 
 // 转换模型名称（去掉 azure/ 前缀）
 function normalizeModelName(model) {
@@ -318,6 +319,10 @@ function handleStreamResponse(upstreamResponse, clientResponse, options = {}) {
       clientResponse.flushHeaders()
     }
 
+    // 💓 上游 thinking 静默 >120s 会触发 CF 524，每 15s 在客户端连接上写入注释保活
+    const heartbeat = attachHeartbeat(clientResponse, { logger, label: `Azure:${streamId}` })
+    const stopHeartbeat = () => heartbeat.stop()
+
     // 强化的SSE事件解析，保存所有事件用于最终处理
     const parseSSEForUsage = (data, isFromFinalBuffer = false) => {
       const lines = data.split('\n')
@@ -388,6 +393,8 @@ function handleStreamResponse(upstreamResponse, clientResponse, options = {}) {
     const cleanup = () => {
       if (!hasEnded) {
         hasEnded = true
+        // 💓 停止心跳
+        stopHeartbeat()
         try {
           upstreamResponse.data?.removeAllListeners?.()
           upstreamResponse.data?.destroy?.()
@@ -423,6 +430,8 @@ function handleStreamResponse(upstreamResponse, clientResponse, options = {}) {
         // 转发数据给客户端
         if (!clientResponse.destroyed) {
           clientResponse.write(chunk)
+          // 💓 每次成功转发后重置心跳静默计时
+          heartbeat.markData()
         }
 
         // 同时解析数据以捕获 usage 信息，带缓冲区大小限制
@@ -474,6 +483,8 @@ function handleStreamResponse(upstreamResponse, clientResponse, options = {}) {
 
       streamManager.cleanup(streamId)
       hasEnded = true
+      // 💓 流正常结束，停止心跳
+      stopHeartbeat()
 
       try {
         logger.debug(`🔚 Stream ended, performing comprehensive usage extraction for ${streamId}`, {
@@ -585,6 +596,8 @@ function handleStreamResponse(upstreamResponse, clientResponse, options = {}) {
 
       streamManager.cleanup(streamId)
       hasEnded = true
+      // 💓 出错时停止心跳
+      stopHeartbeat()
 
       logger.error('Upstream stream error:', error)
 
@@ -607,6 +620,8 @@ function handleStreamResponse(upstreamResponse, clientResponse, options = {}) {
 
     // 客户端断开时清理
     const clientCleanup = () => {
+      // 💓 客户端断开，停止心跳
+      stopHeartbeat()
       streamManager.cleanup(streamId)
     }
 

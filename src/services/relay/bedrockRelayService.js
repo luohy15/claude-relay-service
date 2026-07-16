@@ -8,6 +8,7 @@ const logger = require('../../utils/logger')
 const config = require('../../../config/config')
 const userMessageQueueService = require('../userMessageQueueService')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const { attachHeartbeat } = require('../../utils/sseHeartbeat')
 
 class BedrockRelayService {
   constructor() {
@@ -240,11 +241,26 @@ class BedrockRelayService {
   }
 
   // 处理流式请求
-  async handleStreamRequest(requestBody, bedrockAccount = null, res, req = null) {
+  async handleStreamRequest(
+    requestBody,
+    bedrockAccount = null,
+    res,
+    req = null,
+    externalHeartbeat = null
+  ) {
     const accountId = bedrockAccount?.id
     let queueLockAcquired = false
     let queueRequestId = null
     let abortController = null
+    // 💓 上游 thinking 静默 >120s 会触发 CF 524。若上游（api.js）已在联系上游前启动心跳并传入，
+    // 复用同一句柄，避免重复启动第二个定时器；否则在 200 后自行启动。
+    let heartbeat = externalHeartbeat || null
+    const stopHeartbeat = () => {
+      if (heartbeat) {
+        heartbeat.stop()
+        heartbeat = null
+      }
+    }
 
     try {
       // 📬 用户消息队列处理
@@ -330,6 +346,8 @@ class BedrockRelayService {
       abortController = new AbortController()
       if (req) {
         req.on('close', () => {
+          // 💓 客户端断开，停止心跳
+          stopHeartbeat()
           if (abortController && !abortController.signal.aborted) {
             logger.info(`🔌 客户端断开，取消 Bedrock 上游请求 - 账户: ${accountId}`)
             abortController.abort()
@@ -373,6 +391,14 @@ class BedrockRelayService {
         'Access-Control-Allow-Headers': 'Content-Type, Authorization'
       })
 
+      // 💓 200 后启动心跳（若上游未预先传入）
+      if (!heartbeat) {
+        heartbeat = attachHeartbeat(res, {
+          logger,
+          label: `Bedrock:${bedrockAccount?.name || accountId}`
+        })
+      }
+
       let totalUsage = null
 
       // 处理流式响应
@@ -397,6 +423,10 @@ class BedrockRelayService {
             }
             res.write(`event: ${chunkData.type}\n`)
             res.write(`data: ${JSON.stringify(chunkData)}\n\n`)
+            // 💓 每次成功转发后重置心跳静默计时
+            if (heartbeat) {
+              heartbeat.markData()
+            }
           }
 
           // 提取使用统计 (usage is reported in message_delta per Claude API spec)
@@ -408,6 +438,9 @@ class BedrockRelayService {
 
       const duration = Date.now() - startTime
       logger.info(`✅ Bedrock流式请求完成 - 模型: ${modelId}, 耗时: ${duration}ms`)
+
+      // 💓 流正常结束，停止心跳
+      stopHeartbeat()
 
       // 发送结束事件
       res.write('event: done\n')
@@ -421,6 +454,9 @@ class BedrockRelayService {
         duration
       }
     } catch (error) {
+      // 💓 出错时停止心跳
+      stopHeartbeat()
+
       // 客户端主动断开，不算错误
       if (abortController?.signal?.aborted) {
         logger.info(`🔌 Bedrock 流请求因客户端断开而中止 - 账户: ${accountId}`)

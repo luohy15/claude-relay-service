@@ -2,6 +2,8 @@ const apiKeyService = require('../apiKeyService')
 const { convertMessagesToGemini, convertGeminiResponse } = require('./geminiRelayService')
 const { normalizeAntigravityModelInput } = require('../../utils/antigravityModel')
 const antigravityClient = require('../antigravityClient')
+const logger = require('../../utils/logger')
+const { attachHeartbeat } = require('../../utils/sseHeartbeat')
 
 function buildRequestData({ messages, model, temperature, maxTokens, sessionId }) {
   const requestedModel = normalizeAntigravityModelInput(model)
@@ -175,6 +177,26 @@ async function sendAntigravityRequest({
   return openaiResponse
 }
 
+// 将 SSE 字符串异步生成器逐块写入客户端响应，并挂上共享心跳。
+// 上游（Antigravity/gemini-cli OAuth）thinking 期间生成器会长时间不 yield，
+// 客户端连接静默 >120s 会被 Cloudflare 524；心跳每 15s 独立写入注释保活。
+// 由调用方在返回后负责 res.end()，与原有流式逻辑保持一致。
+async function streamGeneratorWithHeartbeat(generator, res, { signal, label } = {}) {
+  const heartbeat = attachHeartbeat(res, { logger, label: label || 'Antigravity' })
+  try {
+    for await (const chunk of generator) {
+      if (signal?.aborted) {
+        break
+      }
+      res.write(chunk)
+      heartbeat.markData()
+    }
+  } finally {
+    heartbeat.stop()
+  }
+}
+
 module.exports = {
-  sendAntigravityRequest
+  sendAntigravityRequest,
+  streamGeneratorWithHeartbeat
 }

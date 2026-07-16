@@ -573,8 +573,9 @@ class CcrRelayService {
   ) {
     return new Promise((resolve, reject) => {
       let aborted = false
-      // 上游 thinking 静默 >120s 会触发 CF 524；声明心跳句柄，200 成功路径启动、各种结束/异常路径统一清理
-      let heartbeat = null
+      // 上游 thinking 静默 >120s 会触发 CF 524；声明心跳句柄，200 成功路径启动、各种结束/异常路径统一清理。
+      // 💓 W1：若上游已在联系上游前启动心跳并通过 options 传入，则复用同一句柄，避免重复启动第二个定时器。
+      let heartbeat = requestOptions.heartbeat || null
       const stopHeartbeat = () => {
         if (heartbeat) {
           heartbeat.stop()
@@ -768,11 +769,14 @@ class CcrRelayService {
           }
 
           // 💓 启动 SSE 心跳：上游 thinking 期间静默 >120s 会被 Cloudflare 524，
-          // 每 15s 在客户端连接上写入 `: heartbeat\n\n` 注释保活
-          heartbeat = attachHeartbeat(responseStream, {
-            logger,
-            label: `CCR:${account?.name || accountId}`
-          })
+          // 每 15s 在客户端连接上写入 `: heartbeat\n\n` 注释保活。
+          // 若已由上游预先启动并传入（W1），复用同一句柄，避免重复启动第二个定时器。
+          if (!heartbeat) {
+            heartbeat = attachHeartbeat(responseStream, {
+              logger,
+              label: `CCR:${account?.name || accountId}`
+            })
+          }
 
           // 处理流数据和使用统计收集
           let rawBuffer = ''

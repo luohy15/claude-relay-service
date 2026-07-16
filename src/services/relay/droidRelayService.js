@@ -10,6 +10,7 @@ const logger = require('../../utils/logger')
 const runtimeAddon = require('../../utils/runtimeAddon')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
 const { createRequestDetailMeta } = require('../../utils/requestDetailHelper')
+const { attachHeartbeat } = require('../../utils/sseHeartbeat')
 
 const SYSTEM_PROMPT = 'You are Droid, an AI software engineering agent built by Factory.'
 const RUNTIME_EVENT_FMT_PAYLOAD = 'fmtPayload'
@@ -444,6 +445,14 @@ class DroidRelayService {
       let upstreamResponse = null
       let completionWindow = ''
       let hasForwardedData = false
+      // 💓 上游 thinking 静默 >120s 会触发 CF 524；声明心跳句柄，200 成功路径启动、各种结束/异常路径统一清理
+      let heartbeat = null
+      const stopHeartbeat = () => {
+        if (heartbeat) {
+          heartbeat.stop()
+          heartbeat = null
+        }
+      }
 
       const resolveOnce = (value) => {
         if (settled) {
@@ -462,6 +471,8 @@ class DroidRelayService {
       }
 
       const handleStreamError = (error) => {
+        // 💓 出错时停止心跳
+        stopHeartbeat()
         if (responseStarted) {
           const isConnectionReset =
             error && (error.code === 'ECONNRESET' || error.message === 'aborted')
@@ -588,6 +599,12 @@ class DroidRelayService {
         clientResponse.setHeader('Cache-Control', 'no-cache')
         clientResponse.setHeader('Connection', 'keep-alive')
 
+        // 💓 200 后启动心跳
+        heartbeat = attachHeartbeat(clientResponse, {
+          logger,
+          label: `Droid:${account?.name || account?.id}`
+        })
+
         // Usage 数据收集
         let buffer = ''
         const currentUsageData = {}
@@ -602,6 +619,10 @@ class DroidRelayService {
           // 转发数据到客户端
           clientResponse.write(chunk)
           hasForwardedData = true
+          // 💓 每次成功转发后重置心跳静默计时
+          if (heartbeat) {
+            heartbeat.markData()
+          }
 
           // 解析 usage 数据（根据端点类型）
           if (endpointType === 'anthropic') {
@@ -621,6 +642,8 @@ class DroidRelayService {
 
         res.on('end', async () => {
           responseCompleted = true
+          // 💓 流正常结束，停止心跳
+          stopHeartbeat()
           clientResponse.end()
 
           // 记录 usage 数据
@@ -665,6 +688,8 @@ class DroidRelayService {
         res.on('error', handleStreamError)
 
         res.on('close', () => {
+          // 💓 上游连接关闭，停止心跳
+          stopHeartbeat()
           if (settled) {
             return
           }
@@ -682,6 +707,8 @@ class DroidRelayService {
 
       // 客户端断开连接时清理
       clientResponse.on('close', () => {
+        // 💓 客户端断开，停止心跳
+        stopHeartbeat()
         if (req && !req.destroyed) {
           req.destroy(new Error('Client disconnected'))
         }
