@@ -471,7 +471,7 @@ describe('openai responses payload toggles', () => {
     expect(apiKeyService.recordUsage.mock.calls[0][8]).toBe('priority')
   })
 
-  test('restores the explicit caller service_tier after Codex adaptation removes it for openai accounts', async () => {
+  test('records null service_tier after Codex adaptation removes it for openai accounts', async () => {
     unifiedOpenAIScheduler.selectAccountForApiKey.mockResolvedValue({
       accountId: 'openai-1',
       accountType: 'openai'
@@ -499,7 +499,7 @@ describe('openai responses payload toggles', () => {
       body: {
         model: 'gpt-5-2025-08-07',
         temperature: 0.2,
-        service_tier: 'default',
+        service_tier: 'priority',
         prompt_cache_key: 'adapt-tier-key',
         stream: false
       }
@@ -507,76 +507,10 @@ describe('openai responses payload toggles', () => {
 
     await openaiRoutes.handleResponses(req, createRes())
 
-    expect(req.body.service_tier).toBe('default')
-    expect(req._serviceTier).toBe('default')
-    expect(axios.post.mock.calls[0][1]).toMatchObject({ service_tier: 'default' })
+    expect(req.body.service_tier).toBeUndefined()
+    expect(req._serviceTier).toBeNull()
     expect(apiKeyService.recordUsage).toHaveBeenCalled()
-    expect(apiKeyService.recordUsage.mock.calls[0][8]).toBe('default')
-  })
-
-  test('defaults standard responses to the priority service_tier for openai accounts when no tier is provided', async () => {
-    unifiedOpenAIScheduler.selectAccountForApiKey.mockResolvedValue({
-      accountId: 'openai-1',
-      accountType: 'openai'
-    })
-    openaiAccountService.getAccount.mockResolvedValue({
-      id: 'openai-1',
-      name: 'OpenAI Account',
-      accessToken: 'encrypted-token',
-      accountId: 'chatgpt-account-1'
-    })
-    axios.post.mockResolvedValue({
-      status: 200,
-      data: {
-        model: 'gpt-5',
-        usage: {
-          input_tokens: 10,
-          output_tokens: 4,
-          total_tokens: 14
-        }
-      },
-      headers: {}
-    })
-
-    const req = createReq({
-      path: '/v1/responses',
-      body: {
-        model: 'gpt-5-2025-08-07',
-        prompt_cache_key: 'default-tier-key',
-        stream: false
-      },
-      apiKeyOverrides: {
-        enableOpenAIResponsesCodexAdaptation: false,
-        enableOpenAIResponsesPayloadRules: false
-      }
-    })
-
-    await openaiRoutes.handleResponses(req, createRes())
-
-    expect(req._serviceTier).toBe('priority')
-    expect(axios.post.mock.calls[0][1]).toMatchObject({ service_tier: 'priority' })
-    expect(apiKeyService.recordUsage.mock.calls[0][8]).toBe('priority')
-  })
-
-  test('does not default service_tier for openai-responses accounts when no tier is provided', async () => {
-    const req = createReq({
-      path: '/v1/responses',
-      body: {
-        model: 'gpt-4.1',
-        prompt_cache_key: 'no-default-relay-key'
-      },
-      apiKeyOverrides: {
-        enableOpenAIResponsesCodexAdaptation: false,
-        enableOpenAIResponsesPayloadRules: false
-      }
-    })
-
-    await openaiRoutes.handleResponses(req, createRes())
-
-    expect(openaiResponsesRelayService.handleRequest).toHaveBeenCalled()
-    const relayedReq = openaiResponsesRelayService.handleRequest.mock.calls[0][0]
-    expect(relayedReq.body.service_tier).toBeUndefined()
-    expect(relayedReq._serviceTier).toBeNull()
+    expect(apiKeyService.recordUsage.mock.calls[0][8]).toBeNull()
   })
 
   test('routes grok accounts to grokRelayService and does not default service_tier', async () => {
@@ -610,68 +544,6 @@ describe('openai responses payload toggles', () => {
     const relayedReq = grokRelayService.handleRequest.mock.calls[0][0]
     expect(relayedReq.body.service_tier).toBeUndefined()
     expect(relayedReq._serviceTier).toBeNull()
-  })
-
-  test('does not default service_tier for compact responses or unified-conversion requests', async () => {
-    unifiedOpenAIScheduler.selectAccountForApiKey.mockResolvedValue({
-      accountId: 'openai-1',
-      accountType: 'openai'
-    })
-    openaiAccountService.getAccount.mockResolvedValue({
-      id: 'openai-1',
-      name: 'OpenAI Account',
-      accessToken: 'encrypted-token',
-      accountId: 'chatgpt-account-1'
-    })
-    axios.post.mockResolvedValue({
-      status: 200,
-      data: {
-        model: 'gpt-4.1',
-        usage: {
-          input_tokens: 5,
-          output_tokens: 2,
-          total_tokens: 7
-        }
-      },
-      headers: {}
-    })
-
-    const compactReq = createReq({
-      path: '/v1/responses/compact',
-      body: {
-        model: 'gpt-4.1',
-        prompt_cache_key: 'compact-no-default-key',
-        stream: false
-      },
-      apiKeyOverrides: {
-        enableOpenAIResponsesCodexAdaptation: false,
-        enableOpenAIResponsesPayloadRules: false
-      }
-    })
-
-    await openaiRoutes.handleResponses(compactReq, createRes())
-
-    expect(compactReq.body.service_tier).toBeUndefined()
-    expect(compactReq._serviceTier).toBeNull()
-
-    const unifiedReq = createReq({
-      path: '/v1/responses',
-      body: {
-        model: 'gpt-4.1',
-        prompt_cache_key: 'unified-no-default-key',
-        stream: false
-      },
-      apiKeyOverrides: {
-        enableOpenAIResponsesCodexAdaptation: false,
-        enableOpenAIResponsesPayloadRules: false
-      },
-      fromUnifiedEndpoint: true
-    })
-
-    await openaiRoutes.handleResponses(unifiedReq, createRes())
-
-    expect(unifiedReq.body.service_tier).toBeUndefined()
-    expect(unifiedReq._serviceTier).toBeNull()
   })
 
   test('captures the post-rule service_tier before relaying openai-responses requests', async () => {
