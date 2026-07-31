@@ -125,7 +125,8 @@ function createReq({
   body = {},
   userAgent = 'my-client/1.0',
   apiKeyOverrides = {},
-  fromUnifiedEndpoint = false
+  fromUnifiedEndpoint = false,
+  skipCodexModelNormalization = false
 } = {}) {
   return {
     method: 'POST',
@@ -143,7 +144,8 @@ function createReq({
       openaiResponsesPayloadRules: [],
       ...apiKeyOverrides
     },
-    _fromUnifiedEndpoint: fromUnifiedEndpoint
+    _fromUnifiedEndpoint: fromUnifiedEndpoint,
+    _skipCodexModelNormalization: skipCodexModelNormalization
   }
 }
 
@@ -566,6 +568,75 @@ describe('openai responses payload toggles', () => {
     expect(req._serviceTier).toBe('priority')
     expect(openaiResponsesRelayService.handleRequest).toHaveBeenCalled()
     expect(openaiResponsesRelayService.handleRequest.mock.calls[0][0]._serviceTier).toBe('priority')
+  })
+
+  test('a bridged request (_skipCodexModelNormalization) reaches the relay with the model untouched', async () => {
+    unifiedOpenAIScheduler.selectAccountForApiKey.mockResolvedValue({
+      accountId: 'openai-1',
+      accountType: 'openai'
+    })
+    openaiAccountService.getAccount.mockResolvedValue({
+      id: 'openai-1',
+      name: 'OpenAI Account',
+      accessToken: 'encrypted-token',
+      accountId: 'chatgpt-account-1'
+    })
+    axios.post.mockResolvedValue({
+      status: 200,
+      data: {
+        model: 'gpt-5-mini',
+        usage: {
+          input_tokens: 10,
+          output_tokens: 4,
+          total_tokens: 14
+        }
+      },
+      headers: {}
+    })
+
+    const req = createReq({
+      path: '/v1/responses',
+      body: {
+        model: 'gpt-5-mini',
+        prompt_cache_key: 'bridge-key',
+        stream: false
+      },
+      fromUnifiedEndpoint: true,
+      skipCodexModelNormalization: true,
+      apiKeyOverrides: {
+        enableOpenAIResponsesCodexAdaptation: false,
+        enableOpenAIResponsesPayloadRules: false
+      }
+    })
+
+    await openaiRoutes.handleResponses(req, createRes())
+
+    expect(unifiedOpenAIScheduler.selectAccountForApiKey).toHaveBeenCalledWith(
+      req.apiKey,
+      createHash('bridge-key'),
+      'gpt-5-mini'
+    )
+    expect(req.body.model).toBe('gpt-5-mini')
+    expect(axios.post.mock.calls[0][1]).toMatchObject({ model: 'gpt-5-mini' })
+  })
+
+  test('regression guard: a non-bridged compact-route request still normalizes gpt-5-* to gpt-5', async () => {
+    const req = createReq({
+      path: '/v1/responses/compact',
+      body: {
+        model: 'gpt-5-mini',
+        prompt_cache_key: 'compact-normalize-key'
+      },
+      apiKeyOverrides: {
+        enableOpenAIResponsesCodexAdaptation: false,
+        enableOpenAIResponsesPayloadRules: false
+      }
+    })
+
+    await openaiRoutes.handleResponses(req, createRes())
+
+    expect(req.body.model).toBe('gpt-5')
+    expect(req.body.instructions).toBe(openaiRoutes.CODEX_CLI_INSTRUCTIONS)
   })
 
   test('does not apply the new rule flow to compact responses routes', async () => {
