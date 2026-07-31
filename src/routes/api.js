@@ -31,6 +31,11 @@ const {
   handleAnthropicMessagesToGemini,
   handleAnthropicCountTokensToGemini
 } = require('../services/anthropicGeminiBridgeService')
+const {
+  handleAnthropicToResponses,
+  estimateInputTokens,
+  buildErrorEnvelope
+} = require('../services/anthropicToResponses')
 const router = express.Router()
 
 function queueRateLimitUpdate(
@@ -138,6 +143,23 @@ function isOldSession(body) {
   return false
 }
 
+/**
+ * 模型限制（黑名单）校验：去除供应商前缀后比对 restrictedModels
+ * @param {Object} apiKey - req.apiKey
+ * @param {string} model - 请求的模型名
+ * @returns {boolean} 是否被限制
+ */
+function isModelRestricted(apiKey, model) {
+  if (
+    !apiKey?.enableModelRestriction ||
+    !Array.isArray(apiKey.restrictedModels) ||
+    apiKey.restrictedModels.length === 0
+  ) {
+    return false
+  }
+  return apiKey.restrictedModels.includes(getEffectiveModel(model || ''))
+}
+
 // 🔧 共享的消息处理函数
 async function handleMessagesRequest(req, res) {
   try {
@@ -154,6 +176,16 @@ async function handleMessagesRequest(req, res) {
       req._fromUnifiedEndpoint = true
       const openaiRoutes = require('./openaiRoutes') // lazy require, avoid app.js circular load
       return await openaiRoutes.handleResponses(req, res)
+    }
+
+    // 🌉 /codex/api、/grok/api：Anthropic Messages ↔ OpenAI Responses 桥接（Codex / Grok 订阅账户）。
+    // 同样必须在 Claude 权限校验之前：这些 cr_ key 只带 openai 权限，桥接内部由 handleResponses 校验。
+    // 模型黑名单是认证链的必备一环，而下面那段校验在本分支之后，所以这里显式补上（响应用 Anthropic 信封）。
+    if (forcedVendor === 'codex' || forcedVendor === 'grok') {
+      if (isModelRestricted(req.apiKey, req.body?.model)) {
+        return res.status(403).json(buildErrorEnvelope(403, { message: '暂无该模型访问权限' }))
+      }
+      return await handleAnthropicToResponses(req, res, forcedVendor)
     }
 
     if (!apiKeyService.hasPermission(req.apiKey?.permissions, requiredService)) {
@@ -196,20 +228,13 @@ async function handleMessagesRequest(req, res) {
     }
 
     // 模型限制（黑名单）校验：统一在此处处理（去除供应商前缀）
-    if (
-      req.apiKey.enableModelRestriction &&
-      Array.isArray(req.apiKey.restrictedModels) &&
-      req.apiKey.restrictedModels.length > 0
-    ) {
-      const effectiveModel = getEffectiveModel(req.body.model || '')
-      if (req.apiKey.restrictedModels.includes(effectiveModel)) {
-        return res.status(403).json({
-          error: {
-            type: 'forbidden',
-            message: '暂无该模型访问权限'
-          }
-        })
-      }
+    if (isModelRestricted(req.apiKey, req.body.model)) {
+      return res.status(403).json({
+        error: {
+          type: 'forbidden',
+          message: '暂无该模型访问权限'
+        }
+      })
     }
 
     logger.api('📥 /v1/messages request received', {
@@ -1703,25 +1728,36 @@ router.get('/v1/organizations/:org_id/usage', authenticateApiKey, async (req, re
 
 // 🔢 Token计数端点 - count_tokens beta API
 router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) => {
-  // 按路径强制分流到 Gemini OAuth 账户（避免 model 前缀混乱）
+  // 按路径强制分流（避免 model 前缀混乱）：gemini-cli/antigravity → Gemini OAuth，codex/grok → Responses 桥接
   const forcedVendor = req._anthropicVendor || null
-  const requiredService =
-    forcedVendor === 'gemini-cli' || forcedVendor === 'antigravity' ? 'gemini' : 'claude'
+  const permissionMessages = {
+    gemini: 'This API key does not have permission to access Gemini',
+    openai: 'This API key does not have permission to access OpenAI',
+    claude: 'This API key does not have permission to access Claude'
+  }
+  let requiredService = 'claude'
+  if (forcedVendor === 'gemini-cli' || forcedVendor === 'antigravity') {
+    requiredService = 'gemini'
+  } else if (forcedVendor === 'codex' || forcedVendor === 'grok') {
+    requiredService = 'openai'
+  }
 
   if (!apiKeyService.hasPermission(req.apiKey?.permissions, requiredService)) {
     return res.status(403).json({
       error: {
         type: 'permission_error',
-        message:
-          requiredService === 'gemini'
-            ? 'This API key does not have permission to access Gemini'
-            : 'This API key does not have permission to access Claude'
+        message: permissionMessages[requiredService]
       }
     })
   }
 
   if (requiredService === 'gemini') {
     return await handleAnthropicCountTokensToGemini(req, res, { vendor: forcedVendor })
+  }
+
+  // Codex / Grok 上游没有 token 计数端点，返回本地估算（Claude Code 只用它做上下文预算）
+  if (requiredService === 'openai') {
+    return res.status(200).json({ input_tokens: estimateInputTokens(req.body) })
   }
 
   // 🔗 会话绑定验证（与 messages 端点保持一致）

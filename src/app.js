@@ -351,6 +351,25 @@ class Application {
         },
         apiRoutes
       )
+      // Anthropic (Claude Code) 路由：按路径强制分流到 OpenAI Responses 上游（订阅账户）
+      // - /codex/api/v1/messages -> ChatGPT Codex 订阅
+      // - /grok/api/v1/messages  -> grok.com 订阅
+      this.app.use(
+        '/codex/api',
+        (req, res, next) => {
+          req._anthropicVendor = 'codex'
+          next()
+        },
+        apiRoutes
+      )
+      this.app.use(
+        '/grok/api',
+        (req, res, next) => {
+          req._anthropicVendor = 'grok'
+          next()
+        },
+        apiRoutes
+      )
       this.app.use('/admin', adminRoutes)
       this.app.use('/users', userRoutes)
       // 使用 web 路由（包含 auth 和页面重定向）

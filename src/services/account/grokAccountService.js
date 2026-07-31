@@ -25,6 +25,11 @@ const ACCOUNT_SESSION_MAPPING_PREFIX = 'grok_session_account_mapping:'
 // grok.com 订阅代理（CLI chat proxy），Grok Build 请求的固定上游目标
 const GROK_PROXY_BASE_API = 'https://cli-chat-proxy.grok.com/v1'
 
+// grok CLI 的客户端指纹头部（x-grok-client-version / x-grok-client-identifier）
+// grok-build 客户端自带，非 grok 客户端（如 Claude Code 走 /grok/api 桥接）需由服务端注入
+const GROK_CLI_CLIENT_VERSION = '0.2.101'
+const GROK_CLI_CLIENT_IDENTIFIER = 'grok-shell'
+
 // grok.com OIDC（auth.x.ai）公开客户端 ID，与 grok CLI 使用同一 client_id
 const GROK_OIDC_CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828'
 const GROK_OIDC_TOKEN_ENDPOINT = 'https://auth.x.ai/oauth2/token'
@@ -795,6 +800,8 @@ function sanitizeAccountForResponse(account) {
 
 module.exports = {
   GROK_PROXY_BASE_API,
+  GROK_CLI_CLIENT_VERSION,
+  GROK_CLI_CLIENT_IDENTIFIER,
   createAccount,
   getAccount,
   updateAccount,
