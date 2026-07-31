@@ -19,6 +19,7 @@
 const { StringDecoder } = require('string_decoder')
 const logger = require('../utils/logger')
 const sessionHelper = require('../utils/sessionHelper')
+const { stripModelCapabilitySuffix } = require('../utils/modelHelper')
 
 // HTTP 状态码 → Anthropic 错误类型
 const ANTHROPIC_ERROR_TYPES = {
@@ -247,7 +248,9 @@ function mapReasoningEffort(body) {
 function buildResponsesRequestFromAnthropic(anthropicBody = {}, options = {}) {
   const vendor = options.vendor === 'grok' ? 'grok' : 'codex'
   const result = {
-    model: anthropicBody.model,
+    // 上游只认真实模型 id：客户端能力后缀（gpt-5.6-sol[1m]）在这里剥掉，
+    // 响应侧仍回显客户端请求的原始模型（见 patchResponseForAnthropic）
+    model: stripModelCapabilitySuffix(anthropicBody.model),
     stream: anthropicBody.stream === true
   }
 
@@ -901,6 +904,8 @@ function patchResponseForAnthropic(res, { model, stream }) {
 async function handleAnthropicToResponses(req, res, vendor) {
   const anthropicBody = req.body || {}
   const requestedModel = anthropicBody.model || ''
+  // 上游请求（含 grok 的模型覆盖头）用真实模型 id，客户端可见的响应仍用 requestedModel
+  const upstreamModel = stripModelCapabilitySuffix(requestedModel)
   const isStream = anthropicBody.stream === true
 
   // Claude Code 不发 session_id / conversation_id / prompt_cache_key，粘性会话会退化成无；
@@ -912,7 +917,7 @@ async function handleAnthropicToResponses(req, res, vendor) {
   req.headers['accept'] = isStream ? 'text/event-stream' : 'application/json'
 
   if (vendor === 'grok') {
-    applyGrokHeaders(req, requestedModel)
+    applyGrokHeaders(req, upstreamModel)
   }
 
   patchResponseForAnthropic(res, { model: requestedModel, stream: isStream })
@@ -928,7 +933,7 @@ async function handleAnthropicToResponses(req, res, vendor) {
   req._skipCodexModelNormalization = true
 
   logger.api(
-    `🌉 Anthropic→Responses bridge: vendor=${vendor}, model=${requestedModel}, stream=${isStream}`
+    `🌉 Anthropic→Responses bridge: vendor=${vendor}, model=${requestedModel}, upstreamModel=${upstreamModel}, stream=${isStream}`
   )
 
   const openaiRoutes = require('../routes/openaiRoutes') // lazy require, avoid app.js circular load

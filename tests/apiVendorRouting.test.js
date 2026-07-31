@@ -96,11 +96,21 @@ function createResponse() {
   return res
 }
 
-function createRequest({ baseUrl, model, anthropicVendor, permissions = [] }) {
+function createRequest({
+  baseUrl,
+  model,
+  anthropicVendor,
+  permissions = [],
+  restrictedModels = []
+}) {
   return {
     baseUrl,
     body: { model },
-    apiKey: { permissions, restrictedModels: [] },
+    apiKey: {
+      permissions,
+      enableModelRestriction: restrictedModels.length > 0,
+      restrictedModels
+    },
     _anthropicVendor: anthropicVendor
   }
 }
@@ -155,6 +165,45 @@ describe('handleMessagesRequest vendor routing on the unified /api mount', () =>
     expect(res.body.error.message).toBe('此 API Key 无权访问 Claude 服务')
   })
 
+  it('gpt-5.6-sol[1m]: the client capability suffix still routes to the codex bridge', async () => {
+    const req = createRequest({ baseUrl: '/api', model: 'gpt-5.6-sol[1m]' })
+    const res = createResponse()
+
+    await handleMessagesRequest(req, res)
+
+    expect(handleAnthropicToResponses).toHaveBeenCalledWith(req, res, 'codex')
+    expect(openaiRoutes.handleResponses).not.toHaveBeenCalled()
+    // 请求体里的模型保持客户端原样，剥后缀只发生在路由判断与上游请求体里
+    expect(req.body.model).toBe('gpt-5.6-sol[1m]')
+  })
+
+  it('gpt-5.6-sol[1m]: the model blacklist is compared against the real upstream model', async () => {
+    const req = createRequest({
+      baseUrl: '/api',
+      model: 'gpt-5.6-sol[1m]',
+      restrictedModels: ['gpt-5.6-sol']
+    })
+    const res = createResponse()
+
+    await handleMessagesRequest(req, res)
+
+    expect(handleAnthropicToResponses).not.toHaveBeenCalled()
+    expect(res.status).toHaveBeenCalledWith(403)
+    expect(res.body.error.message).toBe('暂无该模型访问权限')
+  })
+
+  it('claude-* with the capability suffix still takes the native Claude path', async () => {
+    const req = createRequest({ baseUrl: '/api', model: 'claude-opus-4-5-20251101[1m]' })
+    const res = createResponse()
+    apiKeyService.hasPermission.mockReturnValue(false)
+
+    await handleMessagesRequest(req, res)
+
+    expect(openaiRoutes.handleResponses).not.toHaveBeenCalled()
+    expect(handleAnthropicToResponses).not.toHaveBeenCalled()
+    expect(apiKeyService.hasPermission).toHaveBeenCalledWith([], 'claude')
+  })
+
   it('/codex/api + grok-4.5: the path-forced vendor override wins over the model id', async () => {
     const req = createRequest({
       baseUrl: '/codex/api',
@@ -186,6 +235,24 @@ describe('count_tokens vendor routing on the unified /api mount', () => {
 
     expect(res.status).toHaveBeenCalledWith(200)
     expect(res.body).toEqual({ input_tokens: 42 })
+  })
+
+  it('gpt-5.6-sol[1m] resolves the same openai branch as the unsuffixed id', async () => {
+    const handler = countTokensHandler
+    apiKeyService.hasPermission.mockImplementation((_permissions, service) => service === 'openai')
+    estimateInputTokens.mockReturnValue(7)
+
+    const req = createRequest({
+      baseUrl: '/api',
+      model: 'gpt-5.6-sol[1m]',
+      permissions: ['openai']
+    })
+    const res = createResponse()
+
+    await handler(req, res)
+
+    expect(res.status).toHaveBeenCalledWith(200)
+    expect(res.body).toEqual({ input_tokens: 7 })
   })
 
   it('claude-* still takes the Claude count_tokens path unchanged', async () => {

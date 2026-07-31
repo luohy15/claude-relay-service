@@ -278,6 +278,31 @@ function getRateLimitModelFamily(modelName) {
 }
 
 /**
+ * Claude Code 的客户端能力后缀：`<model>[1m]` 表示"客户端按 1M 上下文预算跑这个模型"
+ * （opus[1m] / sonnet[1m] 同款约定）。它是**客户端**的窗口声明，不是上游模型 id 的一部分。
+ */
+const CLIENT_CAPABILITY_SUFFIX_PATTERN = /\[1m\]$/i
+
+/**
+ * 剥掉客户端能力后缀，得到上游真实模型 id。
+ *
+ * 必须在 vendor 路由、模型黑名单比较、上游请求体之前调用；回给客户端的响应仍然回显
+ * 带后缀的原始请求模型，保持 Claude Code 的请求/响应模型一致（plan 2989 设计决策 1-3）。
+ *
+ * @param {string} modelStr - 客户端请求的模型 id，如 'gpt-5.6-sol[1m]'
+ * @returns {string} - 上游真实模型 id，如 'gpt-5.6-sol'；没有该后缀时原样返回
+ */
+function stripModelCapabilitySuffix(modelStr) {
+  if (typeof modelStr !== 'string' || !modelStr) {
+    return ''
+  }
+
+  const stripped = modelStr.replace(CLIENT_CAPABILITY_SUFFIX_PATTERN, '')
+  // 只有后缀没有模型名（'[1m]'）时原样返回：那不是能力后缀，交给下游按未知模型处理
+  return stripped || modelStr
+}
+
+/**
  * 判断模型 id 是否为原生前缀（claude-/gemini-/gpt-）。
  *
  * 用于路径分流：原生前缀走对应的原生后端（Claude/Gemini/OpenAI），非原生前缀
@@ -378,6 +403,7 @@ module.exports = {
   isClaudeFamilyModel,
   RATE_LIMITED_MODEL_FAMILIES,
   getRateLimitModelFamily,
+  stripModelCapabilitySuffix,
   isNativeModelPrefix,
   DEFAULT_MODEL_VENDOR_ROUTES,
   resolveVendorFromModel

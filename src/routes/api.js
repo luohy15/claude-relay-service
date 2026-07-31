@@ -12,7 +12,8 @@ const {
   getEffectiveModel,
   parseVendorPrefixedModel,
   isNativeModelPrefix,
-  resolveVendorFromModel
+  resolveVendorFromModel,
+  stripModelCapabilitySuffix
 } = require('../utils/modelHelper')
 const sessionHelper = require('../utils/sessionHelper')
 const { updateRateLimitCounters } = require('../utils/rateLimitHelper')
@@ -168,7 +169,10 @@ async function handleMessagesRequest(req, res) {
 
     // 🧭 统一 /api 挂载点：按模型 id 前缀解析出订阅桥接 vendor（codex/grok），仅用于挑选转换器；
     // req._anthropicVendor（/codex/api、/grok/api 的路径强制分流）始终优先，保持 2972 已上线行为不变。
-    const modelVendor = req.baseUrl === '/api' ? resolveVendorFromModel(req.body?.model) : null
+    // 客户端能力后缀（gpt-5.6-sol[1m]）只是 Claude Code 侧的上下文预算声明，路由与模型黑名单
+    // 一律用剥掉后缀的真实模型；不带后缀的模型 id 逐字节相同，原有分流零变化。
+    const upstreamModel = stripModelCapabilitySuffix(req.body?.model)
+    const modelVendor = req.baseUrl === '/api' ? resolveVendorFromModel(upstreamModel) : null
     const forcedVendor = req._anthropicVendor || modelVendor
     const requiredService =
       forcedVendor === 'gemini-cli' || forcedVendor === 'antigravity' ? 'gemini' : 'claude'
@@ -176,7 +180,7 @@ async function handleMessagesRequest(req, res) {
     // 🛣️ /api 挂载点：非原生前缀（claude-/gemini-/gpt-）的模型走 openai-responses(OpenRouter) 后端，
     // 让 Anthropic-Messages 流量的 per-model usage 落到 user-model-stats；原生 claude 模型零回归。
     // 必须在 Claude 权限校验之前：OpenRouter 的 cr_ key 只有 openai 权限，否则会被 403。
-    if (req.baseUrl === '/api' && !forcedVendor && !isNativeModelPrefix(req.body?.model)) {
+    if (req.baseUrl === '/api' && !forcedVendor && !isNativeModelPrefix(upstreamModel)) {
       req._fromUnifiedEndpoint = true
       const openaiRoutes = require('./openaiRoutes') // lazy require, avoid app.js circular load
       return await openaiRoutes.handleResponses(req, res)
@@ -187,7 +191,7 @@ async function handleMessagesRequest(req, res) {
     // 同样必须在 Claude 权限校验之前：这些 cr_ key 只带 openai 权限，桥接内部由 handleResponses 校验。
     // 模型黑名单是认证链的必备一环，而下面那段校验在本分支之后，所以这里显式补上（响应用 Anthropic 信封）。
     if (forcedVendor === 'codex' || forcedVendor === 'grok') {
-      if (isModelRestricted(req.apiKey, req.body?.model)) {
+      if (isModelRestricted(req.apiKey, upstreamModel)) {
         return res.status(403).json(buildErrorEnvelope(403, { message: '暂无该模型访问权限' }))
       }
       return await handleAnthropicToResponses(req, res, forcedVendor)
@@ -1736,7 +1740,10 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
   // 按路径强制分流（避免 model 前缀混乱）：gemini-cli/antigravity → Gemini OAuth，codex/grok → Responses 桥接。
   // 统一 /api 挂载点上再按模型 id 前缀补上 codex/grok，否则 Claude Code 每轮都会调用的这个端点
   // 会用 requiredService='claude' 403 掉只有 openai 权限的 key（同 handleMessagesRequest 的分流逻辑）。
-  const modelVendor = req.baseUrl === '/api' ? resolveVendorFromModel(req.body?.model) : null
+  const modelVendor =
+    req.baseUrl === '/api'
+      ? resolveVendorFromModel(stripModelCapabilitySuffix(req.body?.model))
+      : null
   const forcedVendor = req._anthropicVendor || modelVendor
   const permissionMessages = {
     gemini: 'This API key does not have permission to access Gemini',

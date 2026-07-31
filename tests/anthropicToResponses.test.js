@@ -80,6 +80,21 @@ describe('anthropicToResponses request converter', () => {
     expect(result.max_output_tokens).toBeUndefined()
   })
 
+  test('strips the client [1m] capability suffix from the upstream model id', () => {
+    const build = (model, vendor) =>
+      buildResponsesRequestFromAnthropic(
+        { model, messages: [{ role: 'user', content: 'hi' }] },
+        { vendor }
+      )
+
+    // Claude Code 用 `<model>[1m]` 声明自己按 1M 上下文预算跑，上游只认真实模型 id
+    expect(build('gpt-5.6-sol[1m]', 'codex').model).toBe('gpt-5.6-sol')
+    expect(build('grok-4.5[1m]', 'grok').model).toBe('grok-4.5')
+    // 不带后缀 / 其它括号形态一律原样透传
+    expect(build('gpt-5.6-sol', 'codex').model).toBe('gpt-5.6-sol')
+    expect(build('gpt-5.6-sol[200k]', 'codex').model).toBe('gpt-5.6-sol[200k]')
+  })
+
   test('converts a multi-turn tool round-trip into function_call / function_call_output items', () => {
     const result = buildResponsesRequestFromAnthropic(
       {
@@ -739,6 +754,68 @@ describe('anthropicToResponses bridge entry', () => {
     expect(JSON.parse(args)).toEqual({ command: 'echo 你好' })
   })
 
+  test('normalizes [1m] upstream while echoing the requested model in the stream', async () => {
+    openaiRoutes.handleResponses.mockImplementation(async (req, res) => {
+      res.write(
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1m"}}\n\n'
+      )
+      res.write(
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"RELAY-OK"}\n\n'
+      )
+      res.write(
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1m","status":"completed","usage":{"input_tokens":9,"output_tokens":2}}}\n\n'
+      )
+      res.end()
+    })
+
+    const req = createFakeReq({
+      model: 'gpt-5.6-sol[1m]',
+      stream: true,
+      messages: [{ role: 'user', content: 'say RELAY-OK' }]
+    })
+    const { res, captured } = createFakeRes()
+
+    await handleAnthropicToResponses(req, res, 'codex')
+
+    // 上游请求 + usage 归属用真实模型（handleResponses 之后读的就是这个 req.body.model）
+    expect(req.body.model).toBe('gpt-5.6-sol')
+
+    // 客户端侧仍然是它请求的那个 id，保持 Claude Code 的请求/响应模型一致
+    const events = parseSSE(captured.chunks.join(''))
+    expect(events[0].event).toBe('message_start')
+    expect(events[0].data.message.model).toBe('gpt-5.6-sol[1m]')
+  })
+
+  test('normalizes [1m] upstream while echoing the requested model in a non-stream reply', async () => {
+    openaiRoutes.handleResponses.mockImplementation(async (req, res) =>
+      res.json({
+        object: 'response',
+        id: 'resp_ns_1m',
+        status: 'completed',
+        // 上游回显的是它自己的模型名，不能覆盖客户端请求的 id
+        model: 'gpt-5.6-sol',
+        output: [{ type: 'message', content: [{ type: 'output_text', text: 'RELAY-OK' }] }],
+        usage: { input_tokens: 12, output_tokens: 3 }
+      })
+    )
+
+    const req = createFakeReq({
+      model: 'gpt-5.6-sol[1m]',
+      stream: false,
+      messages: [{ role: 'user', content: 'say RELAY-OK' }]
+    })
+    const { res, captured } = createFakeRes()
+
+    await handleAnthropicToResponses(req, res, 'codex')
+
+    expect(req.body.model).toBe('gpt-5.6-sol')
+    expect(captured.json).toMatchObject({
+      type: 'message',
+      model: 'gpt-5.6-sol[1m]',
+      content: [{ type: 'text', text: 'RELAY-OK' }]
+    })
+  })
+
   test('injects grok client headers on the grok mount', async () => {
     openaiRoutes.handleResponses.mockImplementation(async (req, res) => res.end())
 
@@ -754,6 +831,22 @@ describe('anthropicToResponses bridge entry', () => {
     expect(req.headers['x-grok-client-version']).toBe('0.2.101')
     expect(req.headers['x-grok-client-identifier']).toBe('grok-shell')
     expect(req.headers['x-grok-model-override']).toBe('grok-4.5')
+  })
+
+  test('the grok model override header carries the normalized upstream model', async () => {
+    openaiRoutes.handleResponses.mockImplementation(async (req, res) => res.end())
+
+    const req = createFakeReq({
+      model: 'grok-4.5[1m]',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    const { res } = createFakeRes()
+
+    await handleAnthropicToResponses(req, res, 'grok')
+
+    expect(req.headers['x-grok-model-override']).toBe('grok-4.5')
+    expect(req.body.model).toBe('grok-4.5')
   })
 
   test('converts a non-stream JSON response into an Anthropic message', async () => {

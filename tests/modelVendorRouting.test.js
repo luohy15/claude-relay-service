@@ -1,4 +1,8 @@
-const { resolveVendorFromModel, DEFAULT_MODEL_VENDOR_ROUTES } = require('../src/utils/modelHelper')
+const {
+  resolveVendorFromModel,
+  stripModelCapabilitySuffix,
+  DEFAULT_MODEL_VENDOR_ROUTES
+} = require('../src/utils/modelHelper')
 
 describe('resolveVendorFromModel', () => {
   it('maps gpt-* ids to the codex bridge', () => {
@@ -36,6 +40,45 @@ describe('resolveVendorFromModel', () => {
       { prefix: 'gpt-', vendor: 'codex' },
       { prefix: 'grok-', vendor: 'grok' }
     ])
+  })
+})
+
+describe('stripModelCapabilitySuffix', () => {
+  it('strips the trailing [1m] client capability suffix', () => {
+    expect(stripModelCapabilitySuffix('gpt-5.6-sol[1m]')).toBe('gpt-5.6-sol')
+    expect(stripModelCapabilitySuffix('claude-opus-4-5-20251101[1m]')).toBe(
+      'claude-opus-4-5-20251101'
+    )
+  })
+
+  it('is case-insensitive on the suffix', () => {
+    expect(stripModelCapabilitySuffix('gpt-5.6-sol[1M]')).toBe('gpt-5.6-sol')
+  })
+
+  it('leaves model ids without the suffix untouched', () => {
+    expect(stripModelCapabilitySuffix('gpt-5.6-sol')).toBe('gpt-5.6-sol')
+    expect(stripModelCapabilitySuffix('grok-4.5')).toBe('grok-4.5')
+    expect(stripModelCapabilitySuffix('x-ai/grok-4')).toBe('x-ai/grok-4')
+  })
+
+  it('leaves unrelated bracket forms untouched', () => {
+    // 只认结尾的 [1m]：其它括号内容、非结尾位置、别的窗口标记都不是这个能力后缀
+    expect(stripModelCapabilitySuffix('gpt-5.6-sol[200k]')).toBe('gpt-5.6-sol[200k]')
+    expect(stripModelCapabilitySuffix('gpt-5.6-sol[1m]-preview')).toBe('gpt-5.6-sol[1m]-preview')
+    expect(stripModelCapabilitySuffix('gpt-5.6-sol[1m][1m]')).toBe('gpt-5.6-sol[1m]')
+    expect(stripModelCapabilitySuffix('gpt-1m')).toBe('gpt-1m')
+    expect(stripModelCapabilitySuffix('[1m]')).toBe('[1m]')
+  })
+
+  it('returns an empty string for empty/invalid input', () => {
+    expect(stripModelCapabilitySuffix('')).toBe('')
+    expect(stripModelCapabilitySuffix(null)).toBe('')
+    expect(stripModelCapabilitySuffix(123)).toBe('')
+  })
+
+  it('feeds vendor routing the real upstream model', () => {
+    expect(resolveVendorFromModel(stripModelCapabilitySuffix('gpt-5.6-sol[1m]'))).toBe('codex')
+    expect(resolveVendorFromModel(stripModelCapabilitySuffix('grok-4.5[1m]'))).toBe('grok')
   })
 })
 
