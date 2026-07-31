@@ -5,6 +5,25 @@
  * Supports parsing model strings like "ccr,model_name" to extract vendor type and base model.
  */
 
+// config/config.js 可能在某些环境不存在（详见 featureFlags.js 的同款容错处理）
+let config = {}
+try {
+  // eslint-disable-next-line global-require
+  config = require('../../config/config')
+} catch (error) {
+  config = {}
+}
+
+// logger 内部会 require config/config，所以同样需要容错，避免在 config 缺失的环境
+// （如本仓库当前 checkout）里连带炸掉所有直接引用 modelHelper 的测试
+let logger
+try {
+  // eslint-disable-next-line global-require
+  logger = require('./logger')
+} catch (error) {
+  logger = { warn: () => {} }
+}
+
 // 仅保留原仓库既有的模型前缀：CCR 路由
 // Gemini/Antigravity 采用“路径分流”，避免在 model 字段里混入 vendor 前缀造成混乱
 const SUPPORTED_VENDOR_PREFIXES = ['ccr']
@@ -276,6 +295,80 @@ function isNativeModelPrefix(modelName) {
   return model.startsWith('claude-') || model.startsWith('gemini-') || model.startsWith('gpt-')
 }
 
+/**
+ * /api（Anthropic Messages）按模型 id 前缀分流到订阅桥接的内置默认规则。
+ * 仅用于挑选“转换器”（codex / grok 桥接），账户仍然由 API Key 决定。
+ */
+const DEFAULT_MODEL_VENDOR_ROUTES = [
+  { prefix: 'gpt-', vendor: 'codex' },
+  { prefix: 'grok-', vendor: 'grok' }
+]
+
+// handleAnthropicToResponses 只认识这两种桥接 vendor，环境变量里配的其它值一律丢弃
+const SUPPORTED_MODEL_VENDORS = ['codex', 'grok']
+
+/**
+ * 解析 `MODEL_VENDOR_ROUTES` 格式的字符串：'<prefix>:<vendor>,<prefix>:<vendor>'
+ * 未知 vendor 会被丢弃并打印 warn，而不是静默产生一个没有分支处理的 vendor。
+ * @param {string} rawValue
+ * @returns {{prefix: string, vendor: string}[]}
+ */
+function parseModelVendorRoutes(rawValue) {
+  if (!rawValue || typeof rawValue !== 'string') {
+    return DEFAULT_MODEL_VENDOR_ROUTES
+  }
+
+  const routes = rawValue
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const [prefix, vendor] = entry.split(':').map((part) => (part || '').trim().toLowerCase())
+      return { prefix, vendor }
+    })
+    .filter(({ prefix, vendor }) => {
+      if (!prefix || !vendor) {
+        return false
+      }
+      if (!SUPPORTED_MODEL_VENDORS.includes(vendor)) {
+        logger.warn(`⚠️ Unknown vendor "${vendor}" in MODEL_VENDOR_ROUTES, dropping "${prefix}"`)
+        return false
+      }
+      return true
+    })
+
+  return routes.length > 0 ? routes : DEFAULT_MODEL_VENDOR_ROUTES
+}
+
+const rawModelVendorRoutes =
+  (process.env.MODEL_VENDOR_ROUTES !== undefined && process.env.MODEL_VENDOR_ROUTES !== ''
+    ? process.env.MODEL_VENDOR_ROUTES
+    : config?.modelRouting?.vendorRoutes) || ''
+
+const MODEL_VENDOR_ROUTES = parseModelVendorRoutes(rawModelVendorRoutes)
+
+/**
+ * 从模型 id 解析出应该走哪个订阅桥接 vendor（codex / grok），仅用于挑选转换器。
+ *
+ * 带 '/' 的 id（如 OpenRouter 的 x-ai/grok-4）永远返回 null：这是计费路径的区分点，
+ * 必须显式排除，不能靠“不以 grok- 开头”隐式保证。
+ *
+ * @param {string} modelName - Model id, e.g. 'gpt-5.6-sol' / 'grok-4.5'
+ * @returns {'codex'|'grok'|null}
+ */
+function resolveVendorFromModel(modelName) {
+  if (!modelName || typeof modelName !== 'string') {
+    return null
+  }
+  if (modelName.includes('/')) {
+    return null
+  }
+
+  const lowerModel = modelName.toLowerCase()
+  const route = MODEL_VENDOR_ROUTES.find(({ prefix }) => lowerModel.startsWith(prefix))
+  return route ? route.vendor : null
+}
+
 module.exports = {
   parseVendorPrefixedModel,
   hasVendorPrefix,
@@ -285,5 +378,7 @@ module.exports = {
   isClaudeFamilyModel,
   RATE_LIMITED_MODEL_FAMILIES,
   getRateLimitModelFamily,
-  isNativeModelPrefix
+  isNativeModelPrefix,
+  DEFAULT_MODEL_VENDOR_ROUTES,
+  resolveVendorFromModel
 }

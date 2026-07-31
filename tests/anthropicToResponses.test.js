@@ -671,6 +671,7 @@ describe('anthropicToResponses bridge entry', () => {
     // 请求侧：body 转成 Responses 格式，路径与标志同步改写
     expect(req.url).toBe('/v1/responses')
     expect(req._fromUnifiedEndpoint).toBe(true)
+    expect(req._skipCodexModelNormalization).toBe(true)
     expect(req.body.instructions).toBe('You are Claude Code.')
     expect(req.body.input).toHaveLength(1)
     expect(req.headers['accept']).toBe('text/event-stream')

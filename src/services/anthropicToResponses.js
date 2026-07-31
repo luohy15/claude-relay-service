@@ -923,6 +923,9 @@ async function handleAnthropicToResponses(req, res, vendor) {
   // 载荷标志：让 isStandardResponsesRoute() 返回 false，从而跳过 applyCodexCliAdaptation，
   // 保住上面写入 instructions 的 Claude Code 系统提示词
   req._fromUnifiedEndpoint = true
+  // 桥接路径的 payload 已经是最终形态：不能再被 normalizeGpt5ModelForCodex 静默改写成 gpt-5，
+  // 否则 bot 配置 / usage 统计里的模型和实际调用的模型对不上（S6）
+  req._skipCodexModelNormalization = true
 
   logger.api(
     `🌉 Anthropic→Responses bridge: vendor=${vendor}, model=${requestedModel}, stream=${isStream}`

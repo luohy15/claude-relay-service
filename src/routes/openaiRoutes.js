@@ -397,7 +397,11 @@ const handleResponses = async (req, res) => {
         logger.info('🧩 Standard Responses request applied API key payload rules')
       }
     } else {
-      normalizeGpt5ModelForCodex(req.body)
+      // 桥接路径（anthropicToResponses）已经把最终 payload 定死，不能再被静默重写成 gpt-5，
+      // 否则 bot 配置、usage 统计、tier 归属显示的模型和实际调用的模型会对不上。
+      if (!req._skipCodexModelNormalization) {
+        normalizeGpt5ModelForCodex(req.body)
+      }
 
       if (!isCodexCLI && !req._fromUnifiedEndpoint) {
         applyCodexCliAdaptation(req.body)
@@ -423,7 +427,9 @@ const handleResponses = async (req, res) => {
     sessionHash = sessionId ? crypto.createHash('sha256').update(sessionId).digest('hex') : null
 
     const requestedModel = req.body?.model || null
-    const schedulerModel = getCodexCompatibleModel(requestedModel)
+    const schedulerModel = req._skipCodexModelNormalization
+      ? requestedModel
+      : getCodexCompatibleModel(requestedModel)
     const isStream = req.body?.stream !== false // 默认为流式（兼容现有行为）
 
     if (schedulerModel !== requestedModel) {

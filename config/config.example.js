@@ -204,6 +204,12 @@ const config = {
     retries: parseInt(process.env.WEBHOOK_RETRIES) || 3 // 重试3次
   },
 
+  // 🧭 Anthropic Messages（/api）按模型 id 分流到订阅桥接的规则
+  // 格式：'<prefix>:<vendor>,<prefix>:<vendor>'，留空则使用内置默认 'gpt-:codex,grok-:grok'
+  modelRouting: {
+    vendorRoutes: process.env.MODEL_VENDOR_ROUTES || ''
+  },
+
   // 🛠️ 开发配置
   development: {
     debug: process.env.DEBUG === 'true',
