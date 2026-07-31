@@ -19,8 +19,7 @@ const { createOpenAITestPayload, extractErrorMessage } = require('../../utils/te
 const ProxyHelper = require('../../utils/proxyHelper')
 
 const router = express.Router()
-const GROK_CLI_CLIENT_VERSION = '0.2.101'
-const GROK_CLI_CLIENT_IDENTIFIER = 'grok-shell'
+const { GROK_CLI_CLIENT_VERSION, GROK_CLI_CLIENT_IDENTIFIER } = grokAccountService
 
 // 获取所有 Grok 账户
 router.get('/', authenticateAdmin, async (req, res) => {

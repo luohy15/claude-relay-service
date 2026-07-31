@@ -75,7 +75,11 @@ jest.mock('../src/services/account/grokAccountService', () => ({
   toggleSchedulable: jest.fn(),
   isTokenExpired: jest.fn().mockReturnValue(false),
   sanitizeAccountForResponse: jest.requireActual('../src/services/account/grokAccountService')
-    .sanitizeAccountForResponse
+    .sanitizeAccountForResponse,
+  GROK_CLI_CLIENT_VERSION: jest.requireActual('../src/services/account/grokAccountService')
+    .GROK_CLI_CLIENT_VERSION,
+  GROK_CLI_CLIENT_IDENTIFIER: jest.requireActual('../src/services/account/grokAccountService')
+    .GROK_CLI_CLIENT_IDENTIFIER
 }))
 
 jest.mock('axios')

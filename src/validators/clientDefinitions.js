@@ -26,6 +26,8 @@ const CLIENT_DEFINITIONS = {
       '/claude/v1/models',
       '/antigravity/api/',
       '/gemini-cli/api/',
+      '/codex/api/',
+      '/grok/api/',
       '/api/event_logging',
       '/v1/messages',
       '/v1/models',
