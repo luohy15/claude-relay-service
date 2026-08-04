@@ -14,6 +14,7 @@ jest.mock(
   '../config/config',
   () => ({
     requestTimeout: 600000,
+    claude: {},
     security: { encryptionKey: '12345678901234567890123456789012' }
   }),
   { virtual: true }
@@ -21,6 +22,7 @@ jest.mock(
 jest.mock('../src/models/redis', () => ({}))
 
 const openaiRoutes = require('../src/routes/openaiRoutes')
+const { removeBillingHeaderFromSystem } = require('../src/utils/billingHeader')
 const {
   buildResponsesRequestFromAnthropic,
   createStreamState,
@@ -78,6 +80,56 @@ describe('anthropicToResponses request converter', () => {
     expect(result.include).toEqual(['reasoning.encrypted_content'])
     // chatgpt.com 的 codex 后端不接受 max_output_tokens / temperature / top_p
     expect(result.max_output_tokens).toBeUndefined()
+  })
+
+  test('strips billing headers without changing bridge instructions', () => {
+    const build = (system, vendor = 'codex') =>
+      buildResponsesRequestFromAnthropic(
+        {
+          model: vendor === 'grok' ? 'grok-4.5' : 'gpt-5.6-sol',
+          system,
+          messages: [{ role: 'user', content: 'say RELAY-OK' }]
+        },
+        { vendor }
+      )
+
+    const realSystem = { type: 'text', text: 'You are a helpful coding assistant.' }
+    const firstRequest = build([
+      { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.221; cch=abcde;' },
+      realSystem
+    ])
+    const secondRequest = build([
+      { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.221; cch=f0123;' },
+      realSystem
+    ])
+
+    expect(firstRequest.instructions).toBe('You are a helpful coding assistant.')
+    expect(secondRequest.instructions).toBe(firstRequest.instructions)
+    expect(build([realSystem])).toEqual(
+      expect.objectContaining({ instructions: 'You are a helpful coding assistant.' })
+    )
+    expect(build('You are a helpful coding assistant.')).toEqual(
+      expect.objectContaining({ instructions: 'You are a helpful coding assistant.' })
+    )
+    expect(build('x-anthropic-billing-header: cch=abcde;')).not.toHaveProperty('instructions')
+    expect(build()).not.toHaveProperty('instructions')
+    expect(
+      build([{ type: 'text', text: 'x-anthropic-billing-header: cch=abcde;' }])
+    ).not.toHaveProperty('instructions')
+    expect(
+      build([{ type: 'text', text: 'x-anthropic-billing-header: cch=abcde;' }], 'grok')
+    ).not.toHaveProperty('instructions')
+  })
+
+  test('keeps native billing-header stripping behavior unchanged', () => {
+    const system = [
+      { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.221; cch=abcde;' },
+      { type: 'text', text: 'You are a helpful coding assistant.' }
+    ]
+
+    expect(removeBillingHeaderFromSystem(system)).toEqual([
+      { type: 'text', text: 'You are a helpful coding assistant.' }
+    ])
   })
 
   test('strips the client [1m] capability suffix from the upstream model id', () => {

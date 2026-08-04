@@ -20,6 +20,7 @@ const { StringDecoder } = require('string_decoder')
 const logger = require('../utils/logger')
 const metadataUserIdHelper = require('../utils/metadataUserIdHelper')
 const { stripModelCapabilitySuffix } = require('../utils/modelHelper')
+const { removeBillingHeaderFromSystem } = require('../utils/billingHeader')
 
 // 显式 x-session-id 头的保守校验：这个值会原样转发进上游 header（openaiRoutes.js 的
 // header 白名单），不能让客户端往上游请求头里塞任意内容
@@ -52,6 +53,8 @@ const DROPPED_REASONING_EVENTS = new Set([
 // =============================================
 
 function extractSystemText(system) {
+  system = removeBillingHeaderFromSystem(system)
+
   if (!system) {
     return ''
   }

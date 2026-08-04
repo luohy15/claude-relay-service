@@ -20,6 +20,7 @@ const { isStreamWritable } = require('../../utils/streamHelper')
 const { attachHeartbeat } = require('../../utils/sseHeartbeat')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
 const metadataUserIdHelper = require('../../utils/metadataUserIdHelper')
+const { removeBillingHeaderFromSystem } = require('../../utils/billingHeader')
 const {
   getHttpsAgentForStream,
   getHttpsAgentForNonStream,
@@ -1323,31 +1324,22 @@ class ClaudeRelayService {
       return
     }
 
-    if (typeof processedBody.system === 'string') {
-      if (processedBody.system.trim().startsWith('x-anthropic-billing-header')) {
-        logger.debug('🧹 Removed billing header from string system prompt')
-        delete processedBody.system
-      }
+    const originalSystem = processedBody.system
+    const filteredSystem = removeBillingHeaderFromSystem(originalSystem)
+
+    if (filteredSystem === undefined) {
+      logger.debug('🧹 Removed billing header from string system prompt')
+      delete processedBody.system
       return
     }
 
-    if (Array.isArray(processedBody.system)) {
-      const originalLength = processedBody.system.length
-      processedBody.system = processedBody.system.filter(
-        (item) =>
-          !(
-            item &&
-            item.type === 'text' &&
-            typeof item.text === 'string' &&
-            item.text.trim().startsWith('x-anthropic-billing-header')
-          )
+    if (Array.isArray(originalSystem) && filteredSystem.length < originalSystem.length) {
+      logger.debug(
+        `🧹 Removed ${originalSystem.length - filteredSystem.length} billing header element(s) from system array`
       )
-      if (processedBody.system.length < originalLength) {
-        logger.debug(
-          `🧹 Removed ${originalLength - processedBody.system.length} billing header element(s) from system array`
-        )
-      }
     }
+
+    processedBody.system = filteredSystem
   }
 
   // 🔢 验证并限制max_tokens参数
