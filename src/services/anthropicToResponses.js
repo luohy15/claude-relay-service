@@ -18,8 +18,12 @@
 
 const { StringDecoder } = require('string_decoder')
 const logger = require('../utils/logger')
-const sessionHelper = require('../utils/sessionHelper')
+const metadataUserIdHelper = require('../utils/metadataUserIdHelper')
 const { stripModelCapabilitySuffix } = require('../utils/modelHelper')
+
+// 显式 x-session-id 头的保守校验：这个值会原样转发进上游 header（openaiRoutes.js 的
+// header 白名单），不能让客户端往上游请求头里塞任意内容
+const EXPLICIT_SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
 
 // HTTP 状态码 → Anthropic 错误类型
 const ANTHROPIC_ERROR_TYPES = {
@@ -908,12 +912,41 @@ async function handleAnthropicToResponses(req, res, vendor) {
   const upstreamModel = stripModelCapabilitySuffix(requestedModel)
   const isStream = anthropicBody.stream === true
 
-  // Claude Code 不发 session_id / conversation_id / prompt_cache_key，粘性会话会退化成无；
-  // 用 Anthropic 请求体算一个 session hash 注入头部，让账户粘性生效
-  const sessionHash = sessionHelper.generateSessionHash(anthropicBody)
-  if (sessionHash) {
-    req.headers['session_id'] = sessionHash
+  // 会话身份优先级（高到低），只接受能真正标识会话的来源：
+  // 1. 客户端显式提供的 x-session-id 头（如 y-agent 未来通过 ANTHROPIC_CUSTOM_HEADERS
+  //    注入、取值为其自己稳定的 chat_id——比 Claude Code 自己的 session 概念更稳，见
+  //    pages/plan-3032-cache-key-channel.md）。校验保守字符集+长度上限，见上面
+  //    EXPLICIT_SESSION_ID_PATTERN 的注释。
+  // 2. 否则 Claude Code 自己发的 metadata.user_id 里的 session id：直接读，不走
+  //    sessionHelper.generateSessionHash——那个函数的内容哈希兜底会让不同会话撞成
+  //    同一个 key（两个会话共享系统提示词+首条用户消息时），比不注入还糟，且在
+  //    dashboard 上看不出来（见 pages/review-3032-prompt-cache-key.md §3.2）。
+  //    sessionHelper 本身不改，原生 Claude 粘性路径仍然依赖它的兜底。
+  // 两者都没有 → 400：桥接路径没有可用的稳定会话身份，硬发出去只会制造
+  // shared-bucket 争用，代价比拒绝更大。
+  const rawExplicitSessionId =
+    typeof req.headers['x-session-id'] === 'string' ? req.headers['x-session-id'].trim() : ''
+  const explicitSessionId = EXPLICIT_SESSION_ID_PATTERN.test(rawExplicitSessionId)
+    ? rawExplicitSessionId
+    : ''
+  const sessionHash =
+    explicitSessionId ||
+    metadataUserIdHelper.extractSessionId(anthropicBody?.metadata?.user_id) ||
+    ''
+
+  if (!sessionHash) {
+    logger.warn(
+      `🌉 Anthropic→Responses bridge: rejected, no stable session id (vendor=${vendor}, model=${requestedModel})`
+    )
+    return res.status(400).json(
+      buildErrorEnvelope(400, {
+        message:
+          'Missing stable session id: send an x-session-id header or a Claude Code metadata.user_id'
+      })
+    )
   }
+
+  req.headers['session_id'] = sessionHash
   req.headers['accept'] = isStream ? 'text/event-stream' : 'application/json'
 
   if (vendor === 'grok') {
@@ -922,7 +955,11 @@ async function handleAnthropicToResponses(req, res, vendor) {
 
   patchResponseForAnthropic(res, { model: requestedModel, stream: isStream })
 
+  // prompt_cache_key 只在源请求体（客户端的 Anthropic Messages body）里没有这个字段时
+  // 才写入——协议目前没有这个字段，这里只是让优先级显式：不覆盖任何客户端自带值。
+  const clientPromptCacheKey = anthropicBody.prompt_cache_key
   req.body = buildResponsesRequestFromAnthropic(anthropicBody, { vendor })
+  req.body.prompt_cache_key = clientPromptCacheKey || sessionHash
   // 载荷已是 Responses 格式，路径必须与之匹配（req.path 是只读 getter，派生自 req.url）
   req.url = '/v1/responses'
   // 载荷标志：让 isStandardResponsesRoute() 返回 false，从而跳过 applyCodexCliAdaptation，

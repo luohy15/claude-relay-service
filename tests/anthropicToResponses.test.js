@@ -614,6 +614,10 @@ describe('anthropicToResponses bridge entry', () => {
     const captured = { chunks: [], json: null, ended: false }
     const res = {
       statusCode: 200,
+      status(code) {
+        res.statusCode = code
+        return res
+      },
       write(chunk) {
         captured.chunks.push(chunk.toString())
         return true
@@ -633,8 +637,19 @@ describe('anthropicToResponses bridge entry', () => {
     return { res, captured }
   }
 
+  const DEFAULT_TEST_USER_ID = JSON.stringify({
+    device_id: 'device-default',
+    account_uuid: 'acc-default',
+    session_id: 'session-default'
+  })
+
+  // 默认带一个合法的 metadata.user_id，模拟真实 Claude Code 流量；显式 400 场景/
+  // 自定义 session id 场景通过传自己的 metadata 覆盖它。
   function createFakeReq(body, headers = {}) {
-    return { body, headers: { 'user-agent': 'claude-cli/2.0.0', ...headers } }
+    return {
+      body: { metadata: { user_id: DEFAULT_TEST_USER_ID }, ...body },
+      headers: { 'user-agent': 'claude-cli/2.0.0', ...headers }
+    }
   }
 
   function parseSSE(text) {
@@ -690,8 +705,10 @@ describe('anthropicToResponses bridge entry', () => {
     expect(req.body.instructions).toBe('You are Claude Code.')
     expect(req.body.input).toHaveLength(1)
     expect(req.headers['accept']).toBe('text/event-stream')
-    // 注入 session id，恢复 Claude Code 客户端缺失的粘性会话
-    expect(req.headers['session_id']).toMatch(/^[a-f0-9]{32}$/)
+    // 注入 session id（取自 metadata.user_id），恢复 Claude Code 客户端缺失的粘性会话
+    expect(req.headers['session_id']).toBe('session-default')
+    // 同一个 session id 也写进 body 的 prompt_cache_key，恢复上游缓存路由
+    expect(req.body.prompt_cache_key).toBe(req.headers['session_id'])
     expect(req.headers['x-grok-client-version']).toBeUndefined()
 
     const events = parseSSE(captured.chunks.join(''))
@@ -831,6 +848,119 @@ describe('anthropicToResponses bridge entry', () => {
     expect(req.headers['x-grok-client-version']).toBe('0.2.101')
     expect(req.headers['x-grok-client-identifier']).toBe('grok-shell')
     expect(req.headers['x-grok-model-override']).toBe('grok-4.5')
+    // grok arm gets prompt_cache_key too, not just codex
+    expect(req.body.prompt_cache_key).toBe(req.headers['session_id'])
+  })
+
+  test('prompt_cache_key stays stable across a growing conversation in the same Claude Code session', async () => {
+    openaiRoutes.handleResponses.mockImplementation(async (req, res) => res.end())
+    const userId = JSON.stringify({
+      device_id: 'device-1',
+      account_uuid: 'acc-1',
+      session_id: 'sess-stable-1'
+    })
+
+    const turn1 = createFakeReq({
+      model: 'gpt-5.6-sol',
+      stream: true,
+      metadata: { user_id: userId },
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    const { res: res1 } = createFakeRes()
+    await handleAnthropicToResponses(turn1, res1, 'codex')
+
+    const turn2 = createFakeReq({
+      model: 'gpt-5.6-sol',
+      stream: true,
+      metadata: { user_id: userId },
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'hello' },
+        { role: 'user', content: 'now with a much longer follow-up message that grows the prefix' }
+      ]
+    })
+    const { res: res2 } = createFakeRes()
+    await handleAnthropicToResponses(turn2, res2, 'codex')
+
+    expect(turn1.body.prompt_cache_key).toBe('sess-stable-1')
+    expect(turn2.body.prompt_cache_key).toBe('sess-stable-1')
+    expect(turn1.body.prompt_cache_key).toBe(turn2.body.prompt_cache_key)
+  })
+
+  test('prefers an explicit x-session-id header over the computed session hash', async () => {
+    openaiRoutes.handleResponses.mockImplementation(async (req, res) => res.end())
+
+    const req = createFakeReq(
+      {
+        model: 'grok-4.5',
+        stream: true,
+        metadata: { user_id: JSON.stringify({ device_id: 'd', session_id: 'from-body' }) },
+        messages: [{ role: 'user', content: 'hi' }]
+      },
+      { 'x-session-id': 'chat-external-id-123' }
+    )
+    const { res } = createFakeRes()
+
+    await handleAnthropicToResponses(req, res, 'grok')
+
+    expect(req.headers['session_id']).toBe('chat-external-id-123')
+    expect(req.body.prompt_cache_key).toBe('chat-external-id-123')
+  })
+
+  test('rejects with a 400 Anthropic envelope when neither x-session-id nor metadata.user_id is present', async () => {
+    const req = createFakeReq({
+      metadata: undefined,
+      model: 'gpt-5.6-sol',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    const { res, captured } = createFakeRes()
+
+    await handleAnthropicToResponses(req, res, 'codex')
+
+    expect(openaiRoutes.handleResponses).not.toHaveBeenCalled()
+    expect(res.statusCode).toBe(400)
+    expect(captured.json).toEqual({
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message: expect.stringContaining('Missing stable session id')
+      }
+    })
+  })
+
+  test('rejects with a 400 when metadata.user_id is present but unparseable', async () => {
+    const req = createFakeReq({
+      metadata: { user_id: 'not-a-recognized-format' },
+      model: 'grok-4.5',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    const { res, captured } = createFakeRes()
+
+    await handleAnthropicToResponses(req, res, 'grok')
+
+    expect(openaiRoutes.handleResponses).not.toHaveBeenCalled()
+    expect(res.statusCode).toBe(400)
+    expect(captured.json.error.type).toBe('invalid_request_error')
+  })
+
+  test('rejects an explicit x-session-id that does not match the conservative charset/length, falling back to metadata.user_id', async () => {
+    const req = createFakeReq(
+      {
+        model: 'gpt-5.6-sol',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }]
+      },
+      { 'x-session-id': 'not valid! header value\r\ninjected' }
+    )
+    const { res } = createFakeRes()
+    openaiRoutes.handleResponses.mockImplementation(async (r, s) => s.end())
+
+    await handleAnthropicToResponses(req, res, 'codex')
+
+    // 无效的显式头被忽略，落回 metadata.user_id（本例中是 createFakeReq 的默认值）
+    expect(req.headers['session_id']).toBe('session-default')
   })
 
   test('the grok model override header carries the normalized upstream model', async () => {
