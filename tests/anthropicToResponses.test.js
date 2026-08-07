@@ -663,27 +663,48 @@ describe('anthropicToResponses error envelope and token estimate', () => {
 
 describe('anthropicToResponses bridge entry', () => {
   function createFakeRes() {
-    const captured = { chunks: [], json: null, ended: false }
+    const captured = {
+      chunks: [],
+      json: null,
+      ended: false,
+      headers: {},
+      flushHeadersCalled: false,
+      endCalls: 0
+    }
     const res = {
       statusCode: 200,
       status(code) {
         res.statusCode = code
         return res
       },
+      setHeader(name, value) {
+        captured.headers[String(name).toLowerCase()] = value
+        return res
+      },
+      flushHeaders() {
+        captured.flushHeadersCalled = true
+      },
       write(chunk) {
         captured.chunks.push(chunk.toString())
         return true
       },
       end(chunk) {
+        captured.endCalls += 1
         if (chunk) {
           captured.chunks.push(chunk.toString())
         }
         captured.ended = true
         return res
       },
+      // 模拟 Express: res.json → res.send → this.end(body)。
+      // 若 bridge 没在 finish 前还原 end，patched end 会 re-enter，endCalls 暴涨。
       json(data) {
         captured.json = data
-        return res
+        if (!captured.headers['content-type']) {
+          res.setHeader('Content-Type', 'application/json')
+        }
+        const body = typeof data === 'string' ? data : JSON.stringify(data)
+        return res.end(body)
       }
     }
     return { res, captured }
@@ -856,17 +877,23 @@ describe('anthropicToResponses bridge entry', () => {
   })
 
   test('normalizes [1m] upstream while echoing the requested model in a non-stream reply', async () => {
-    openaiRoutes.handleResponses.mockImplementation(async (req, res) =>
-      res.json({
-        object: 'response',
-        id: 'resp_ns_1m',
-        status: 'completed',
-        // 上游回显的是它自己的模型名，不能覆盖客户端请求的 id
-        model: 'gpt-5.6-sol',
-        output: [{ type: 'message', content: [{ type: 'output_text', text: 'RELAY-OK' }] }],
-        usage: { input_tokens: 12, output_tokens: 3 }
-      })
-    )
+    // 客户端 stream:false 时上游被强制成 SSE；聚合后回显客户端请求的模型 id
+    openaiRoutes.handleResponses.mockImplementation(async (req, res) => {
+      res.setHeader('Content-Type', 'text/event-stream')
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders()
+      }
+      res.write(
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_ns_1m"}}\n\n'
+      )
+      res.write(
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"RELAY-OK"}\n\n'
+      )
+      res.write(
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_ns_1m","status":"completed","model":"gpt-5.6-sol","output":[{"type":"message","content":[{"type":"output_text","text":"RELAY-OK"}]}],"usage":{"input_tokens":12,"output_tokens":3}}}\n\n'
+      )
+      res.end()
+    })
 
     const req = createFakeReq({
       model: 'gpt-5.6-sol[1m]',
@@ -1031,16 +1058,79 @@ describe('anthropicToResponses bridge entry', () => {
     expect(req.body.model).toBe('grok-4.5')
   })
 
-  test('converts a non-stream JSON response into an Anthropic message', async () => {
-    openaiRoutes.handleResponses.mockImplementation(async (req, res) =>
-      res.json({
-        object: 'response',
-        id: 'resp_ns',
-        status: 'completed',
-        output: [{ type: 'message', content: [{ type: 'output_text', text: 'RELAY-OK' }] }],
-        usage: { input_tokens: 12, output_tokens: 3 }
-      })
-    )
+  test('forces stream:true upstream when the client asks for non-stream JSON', async () => {
+    openaiRoutes.handleResponses.mockImplementation(async (req, res) => {
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.setHeader('Cache-Control', 'no-cache')
+      res.setHeader('Connection', 'keep-alive')
+      res.setHeader('X-Accel-Buffering', 'no')
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders()
+      }
+      // 模拟上游 chunk 边界劈开 SSE 事件
+      res.write(
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_ns"}}\n\n'
+      )
+      res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.del')
+      res.write(
+        'ta","delta":"RELAY-OK"}\n\nevent: response.completed\ndata: {"type":"response.completed",'
+      )
+      res.write(
+        '"response":{"id":"resp_ns","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"RELAY-OK"}]}],"usage":{"input_tokens":12,"output_tokens":3}}}\n\n'
+      )
+      res.end()
+    })
+
+    const req = createFakeReq({
+      model: 'gpt-5.6-sol',
+      stream: false,
+      messages: [{ role: 'user', content: 'say RELAY-OK' }]
+    })
+    const { res, captured } = createFakeRes()
+    const logger = require('../src/utils/logger')
+
+    await handleAnthropicToResponses(req, res, 'codex')
+
+    // S1: 上游强制 stream:true，日志仍报客户端 intent（stream=false）
+    expect(req.body.stream).toBe(true)
+    expect(req.headers['accept']).toBe('text/event-stream')
+    expect(logger.api).toHaveBeenCalledWith(expect.stringContaining('stream=false'))
+
+    // S2: 聚合为一条 Anthropic message JSON，Content-Type 是 application/json。
+    // Express 的 json→end 会把 body 写进 chunks；关键是 endCalls 恰好 1（无 re-entry）。
+    expect(captured.headers['content-type']).toBe('application/json')
+    expect(captured.headers.connection).toBeUndefined()
+    expect(captured.headers['x-accel-buffering']).toBeUndefined()
+    expect(captured.endCalls).toBe(1)
+    expect(captured.ended).toBe(true)
+    expect(captured.json).toMatchObject({
+      type: 'message',
+      role: 'assistant',
+      model: 'gpt-5.6-sol',
+      content: [{ type: 'text', text: 'RELAY-OK' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 12, output_tokens: 3 }
+    })
+    expect(JSON.parse(captured.chunks.join(''))).toMatchObject({
+      type: 'message',
+      content: [{ type: 'text', text: 'RELAY-OK' }]
+    })
+  })
+
+  test('returns 502 when a non-stream client request never receives response.completed', async () => {
+    openaiRoutes.handleResponses.mockImplementation(async (req, res) => {
+      res.setHeader('Content-Type', 'text/event-stream')
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders()
+      }
+      res.write(
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_ns_missing"}}\n\n'
+      )
+      res.write(
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+      )
+      res.end()
+    })
 
     const req = createFakeReq({
       model: 'gpt-5.6-sol',
@@ -1051,14 +1141,15 @@ describe('anthropicToResponses bridge entry', () => {
 
     await handleAnthropicToResponses(req, res, 'codex')
 
-    expect(req.body.stream).toBe(false)
-    expect(req.headers['accept']).toBe('application/json')
-    expect(captured.json).toMatchObject({
-      type: 'message',
-      role: 'assistant',
-      model: 'gpt-5.6-sol',
-      content: [{ type: 'text', text: 'RELAY-OK' }],
-      stop_reason: 'end_turn'
+    expect(res.statusCode).toBe(502)
+    expect(captured.headers['content-type']).toBe('application/json')
+    expect(captured.endCalls).toBe(1)
+    expect(captured.json).toEqual({
+      type: 'error',
+      error: {
+        type: 'api_error',
+        message: 'Upstream stream ended without response.completed'
+      }
     })
   })
 

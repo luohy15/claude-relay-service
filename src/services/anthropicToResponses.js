@@ -774,6 +774,34 @@ function convertRawSSEEvent(rawEvent, state) {
   return out
 }
 
+// 从一段原始上游 SSE 事件文本里抽出 response.completed（非流式聚合用）
+function extractCompletedFromRawEvent(rawEvent) {
+  if (!rawEvent || !rawEvent.trim()) {
+    return null
+  }
+
+  let completed = null
+  for (const line of rawEvent.split('\n')) {
+    if (!line.startsWith('data:')) {
+      continue
+    }
+    const payload = line.slice(5).trim()
+    if (!payload || payload === '[DONE]') {
+      continue
+    }
+    let eventData
+    try {
+      eventData = JSON.parse(payload)
+    } catch (error) {
+      continue
+    }
+    if (eventData && eventData.type === 'response.completed' && eventData.response) {
+      completed = eventData
+    }
+  }
+  return completed
+}
+
 function toText(chunk) {
   return (typeof chunk === 'string' ? chunk : chunk.toString()).replace(/\r\n/g, '\n')
 }
@@ -826,12 +854,19 @@ function convertErrorChunk(chunk, statusCode) {
 }
 
 /**
- * 劫持 res.json / res.write / res.end，把下游写出的 Responses 格式响应转成 Anthropic 格式
+ * 劫持 res.json / res.write / res.end，把下游写出的 Responses 格式响应转成 Anthropic 格式。
+ *
+ * stream=true：客户端要 SSE，边收边转成 Anthropic SSE。
+ * stream=false：客户端要单条 JSON，但上游被强制成 stream:true（Codex 拒非流式），
+ *   所以这里缓冲上游 SSE，抽出 response.completed，再 convertResponseToAnthropic 一次写出。
  */
 function patchResponseForAnthropic(res, { model, stream }) {
   const originalJson = res.json.bind(res)
   const originalWrite = res.write.bind(res)
   const originalEnd = res.end.bind(res)
+  const originalSetHeader = typeof res.setHeader === 'function' ? res.setHeader.bind(res) : null
+  const originalFlushHeaders =
+    typeof res.flushHeaders === 'function' ? res.flushHeaders.bind(res) : null
 
   res.json = function (data) {
     if (res.statusCode >= 400) {
@@ -845,7 +880,120 @@ function patchResponseForAnthropic(res, { model, stream }) {
     }
   }
 
+  // 客户端非流式：拦截 SSE 头，聚合成一条 JSON
   if (!stream) {
+    if (originalSetHeader) {
+      res.setHeader = function (name, value) {
+        const lower = String(name).toLowerCase()
+        if (lower === 'content-type') {
+          return originalSetHeader('Content-Type', 'application/json')
+        }
+        // SSE 专属传输头不要落到 JSON 响应上
+        if (lower === 'connection' || lower === 'x-accel-buffering') {
+          return res
+        }
+        return originalSetHeader(name, value)
+      }
+    }
+    if (originalFlushHeaders) {
+      // 等 JSON body 准备好再提交头，避免过早 commit text/event-stream
+      res.flushHeaders = function () {}
+    }
+
+    const buffer = { data: '' }
+    const errorBuffer = { data: '' }
+    const chunkDecoder = createChunkDecoder()
+    const errorDecoder = createChunkDecoder()
+    let completedEvent = null
+
+    const ingestSSE = (text) => {
+      if (!text) {
+        return
+      }
+      buffer.data += text
+      let idx
+      while ((idx = buffer.data.indexOf('\n\n')) !== -1) {
+        const rawEvent = buffer.data.slice(0, idx)
+        buffer.data = buffer.data.slice(idx + 2)
+        const completed = extractCompletedFromRawEvent(rawEvent)
+        if (completed) {
+          completedEvent = completed
+        }
+      }
+    }
+
+    const ensureJsonContentType = () => {
+      if (originalSetHeader) {
+        originalSetHeader('Content-Type', 'application/json')
+      }
+    }
+
+    // Express res.json → res.send → this.end。必须在交出控制权前把 end/write 还原，
+    // 否则 patched end 会经 originalJson 再次进入自己，RangeError 后落到 500。
+    const finishJson = (body) => {
+      res.end = originalEnd
+      res.write = originalWrite
+      ensureJsonContentType()
+      return originalJson(body)
+    }
+
+    res.write = function (chunk, encoding, callback) {
+      if (res.statusCode >= 400) {
+        errorBuffer.data += errorDecoder.write(chunk)
+      } else {
+        ingestSSE(chunkDecoder.write(chunk))
+      }
+      if (typeof callback === 'function') {
+        callback()
+      }
+      return true
+    }
+
+    res.end = function (chunk, encoding, callback) {
+      if (res.statusCode >= 400) {
+        if (chunk) {
+          errorBuffer.data += errorDecoder.write(chunk)
+        }
+        errorBuffer.data += errorDecoder.end()
+        // 与 finishJson 一致：先还原，避免 convertErrorChunk 之后再被别的路径触发 re-entry
+        res.end = originalEnd
+        res.write = originalWrite
+        ensureJsonContentType()
+        return originalEnd(convertErrorChunk(errorBuffer.data, res.statusCode), encoding, callback)
+      }
+
+      if (chunk) {
+        ingestSSE(chunkDecoder.write(chunk))
+      }
+      ingestSSE(chunkDecoder.end())
+      if (buffer.data.trim()) {
+        const completed = extractCompletedFromRawEvent(buffer.data)
+        if (completed) {
+          completedEvent = completed
+        }
+        buffer.data = ''
+      }
+
+      if (!completedEvent) {
+        logger.error(
+          '❌ Anthropic bridge non-stream aggregate failed: upstream stream ended without response.completed'
+        )
+        res.statusCode = 502
+        return finishJson(
+          buildErrorEnvelope(502, {
+            message: 'Upstream stream ended without response.completed'
+          })
+        )
+      }
+
+      try {
+        return finishJson(convertResponseToAnthropic(completedEvent, { model }))
+      } catch (error) {
+        logger.error('❌ Anthropic bridge response conversion failed:', error)
+        res.statusCode = 500
+        return finishJson(buildErrorEnvelope(500, { message: 'Response conversion failed' }))
+      }
+    }
     return
   }
 
@@ -950,7 +1098,10 @@ async function handleAnthropicToResponses(req, res, vendor) {
   }
 
   req.headers['session_id'] = sessionHash
-  req.headers['accept'] = isStream ? 'text/event-stream' : 'application/json'
+  // Codex 后端拒绝 stream:false（"Stream must be set to true"）。无论客户端要不要
+  // SSE，上游一律 stream:true；客户端非流式由 patchResponseForAnthropic 聚合回 JSON。
+  // isStream 仍表示*客户端*意图，日志与响应形态都用它区分，方便对照上游。
+  req.headers['accept'] = 'text/event-stream'
 
   if (vendor === 'grok') {
     applyGrokHeaders(req, upstreamModel)
@@ -963,6 +1114,7 @@ async function handleAnthropicToResponses(req, res, vendor) {
   const clientPromptCacheKey = anthropicBody.prompt_cache_key
   req.body = buildResponsesRequestFromAnthropic(anthropicBody, { vendor })
   req.body.prompt_cache_key = clientPromptCacheKey || sessionHash
+  req.body.stream = true
   // 载荷已是 Responses 格式，路径必须与之匹配（req.path 是只读 getter，派生自 req.url）
   req.url = '/v1/responses'
   // 载荷标志：让 isStandardResponsesRoute() 返回 false，从而跳过 applyCodexCliAdaptation，
