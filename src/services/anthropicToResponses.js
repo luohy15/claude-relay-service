@@ -21,6 +21,7 @@ const logger = require('../utils/logger')
 const metadataUserIdHelper = require('../utils/metadataUserIdHelper')
 const { stripModelCapabilitySuffix } = require('../utils/modelHelper')
 const { removeBillingHeaderFromSystem } = require('../utils/billingHeader')
+const { maskToken } = require('../utils/tokenMask')
 
 // 显式 x-session-id 头的保守校验：这个值会原样转发进上游 header（openaiRoutes.js 的
 // header 白名单），不能让客户端往上游请求头里塞任意内容
@@ -619,14 +620,15 @@ function finalizeStream(state) {
 
 /**
  * 非流式 Responses 响应 → Anthropic Message
- * @param {Object} responseData - Responses 响应对象，或 { type: 'response.completed', response }
+ * @param {Object} responseData - Responses 响应对象，或 { type: 'response.completed' | 'response.incomplete', response }
  * @param {Object} [options]
  * @param {string} [options.model] - 请求侧模型名（回显给客户端）
  * @returns {Object} Anthropic Message 或错误信封
  */
 function convertResponseToAnthropic(responseData, options = {}) {
   const resp =
-    responseData && responseData.type === 'response.completed'
+    responseData &&
+    (responseData.type === 'response.completed' || responseData.type === 'response.incomplete')
       ? responseData.response
       : responseData
 
@@ -774,13 +776,22 @@ function convertRawSSEEvent(rawEvent, state) {
   return out
 }
 
-// 从一段原始上游 SSE 事件文本里抽出 response.completed（非流式聚合用）
-function extractCompletedFromRawEvent(rawEvent) {
+// 非流式聚合视为终态的事件类型：与流式路径（convertStreamEvent 的对应分支）语义一致，
+// completed/incomplete 是正常收尾，failed/error 是上游主动报出的失败
+const AGGREGATE_TERMINAL_EVENT_TYPES = new Set([
+  'response.completed',
+  'response.incomplete',
+  'response.failed',
+  'error'
+])
+
+// 从一段原始上游 SSE 事件文本里抽出最后一个终态事件（非流式聚合用）
+function extractTerminalEventFromRawEvent(rawEvent) {
   if (!rawEvent || !rawEvent.trim()) {
     return null
   }
 
-  let completed = null
+  let terminal = null
   for (const line of rawEvent.split('\n')) {
     if (!line.startsWith('data:')) {
       continue
@@ -795,11 +806,18 @@ function extractCompletedFromRawEvent(rawEvent) {
     } catch (error) {
       continue
     }
-    if (eventData && eventData.type === 'response.completed' && eventData.response) {
-      completed = eventData
+    if (!eventData || !AGGREGATE_TERMINAL_EVENT_TYPES.has(eventData.type)) {
+      continue
     }
+    if (
+      (eventData.type === 'response.completed' || eventData.type === 'response.incomplete') &&
+      !eventData.response
+    ) {
+      continue
+    }
+    terminal = eventData
   }
-  return completed
+  return terminal
 }
 
 function toText(chunk) {
@@ -853,14 +871,35 @@ function convertErrorChunk(chunk, statusCode) {
   }
 }
 
+// 非流式聚合失败时最多重试一次上游请求（首次 + 一次重试），见 A4：失败发生时还没有
+// 任何字节写给客户端（头部被拦截、body 被缓冲），所以重试对客户端透明
+const AGGREGATE_MAX_ATTEMPTS = 2
+// 诊断日志里保留的原始 SSE 尾部字节数上限
+const AGGREGATE_DIAGNOSTIC_TAIL_CHARS = 2048
+
+// S1 诊断尾部只脱敏疑似凭证的片段，不对整段文本用 maskToken：这段文本本身就是诊断
+// 要保留的证据（上游终态事件长什么样），maskToken 对一整段 2KB 文本会把中间 ~30%
+// 星号化，抹掉证据而不是可靠地挡住秘密（真正的秘密不会规律地落在中间）
+const SENSITIVE_INLINE_PATTERN =
+  /((?:bearer\s+|"?(?:api[-_]?key|access[-_]?token|refresh[-_]?token|authorization)"?\s*[:=]\s*"?))([A-Za-z0-9_\-.]{8,})/gi
+
+function maskSensitiveInline(text) {
+  return text.replace(
+    SENSITIVE_INLINE_PATTERN,
+    (match, prefix, secret) => `${prefix}${maskToken(secret)}`
+  )
+}
+
 /**
  * 劫持 res.json / res.write / res.end，把下游写出的 Responses 格式响应转成 Anthropic 格式。
  *
  * stream=true：客户端要 SSE，边收边转成 Anthropic SSE。
  * stream=false：客户端要单条 JSON，但上游被强制成 stream:true（Codex 拒非流式），
- *   所以这里缓冲上游 SSE，抽出 response.completed，再 convertResponseToAnthropic 一次写出。
+ *   所以这里缓冲上游 SSE，抽出终态事件，再 convertResponseToAnthropic 一次写出。
+ * @param {Object} req - 重试时需要重新调用 openaiRoutes.handleResponses(req, res)
+ * @param {Object} res
  */
-function patchResponseForAnthropic(res, { model, stream }) {
+function patchResponseForAnthropic(req, res, { model, stream }) {
   const originalJson = res.json.bind(res)
   const originalWrite = res.write.bind(res)
   const originalEnd = res.end.bind(res)
@@ -902,22 +941,28 @@ function patchResponseForAnthropic(res, { model, stream }) {
 
     const buffer = { data: '' }
     const errorBuffer = { data: '' }
-    const chunkDecoder = createChunkDecoder()
-    const errorDecoder = createChunkDecoder()
-    let completedEvent = null
+    let chunkDecoder = createChunkDecoder()
+    let errorDecoder = createChunkDecoder()
+    let terminalEvent = null
+    let attempt = 1
+    // 诊断用：跟踪本次尝试收到的原始字节数与尾部片段（不随事件解析被消费掉）
+    let receivedBytes = 0
+    let rawTail = ''
 
     const ingestSSE = (text) => {
       if (!text) {
         return
       }
+      receivedBytes += Buffer.byteLength(text, 'utf8')
+      rawTail = (rawTail + text).slice(-AGGREGATE_DIAGNOSTIC_TAIL_CHARS)
       buffer.data += text
       let idx
       while ((idx = buffer.data.indexOf('\n\n')) !== -1) {
         const rawEvent = buffer.data.slice(0, idx)
         buffer.data = buffer.data.slice(idx + 2)
-        const completed = extractCompletedFromRawEvent(rawEvent)
-        if (completed) {
-          completedEvent = completed
+        const terminal = extractTerminalEventFromRawEvent(rawEvent)
+        if (terminal) {
+          terminalEvent = terminal
         }
       }
     }
@@ -935,6 +980,39 @@ function patchResponseForAnthropic(res, { model, stream }) {
       res.write = originalWrite
       ensureJsonContentType()
       return originalJson(body)
+    }
+
+    // 把终态事件转成一条 Anthropic 响应；completed/incomplete 走正常转换，
+    // failed/error 走错误信封，映射种类与流式路径（convertStreamEvent）一致，但
+    // 'error' 的兜底状态码不同：聚合模式这里设的是真实 HTTP 状态码（默认 502，
+    // Bad Gateway），流式模式的 500 只是已经 200 的 SSE 流里内嵌错误信封的元数据默认值
+    const finishTerminalEvent = (event) => {
+      try {
+        if (event.type === 'response.failed') {
+          res.statusCode = 500
+          return finishJson(buildErrorEnvelope(500, event.response?.error || {}))
+        }
+        if (event.type === 'error') {
+          const status = event.status || 502
+          res.statusCode = status
+          return finishJson(buildErrorEnvelope(status, event))
+        }
+        return finishJson(convertResponseToAnthropic(event, { model }))
+      } catch (error) {
+        logger.error('❌ Anthropic bridge response conversion failed:', error)
+        res.statusCode = 500
+        return finishJson(buildErrorEnvelope(500, { message: 'Response conversion failed' }))
+      }
+    }
+
+    // S1：聚合失败时把诊断信息记下来，而不是静默丢弃缓冲内容
+    const logAggregateFailure = () => {
+      const maskedTail = maskSensitiveInline(rawTail).replace(/\n/g, '\\n')
+      logger.error(
+        `❌ Anthropic bridge non-stream aggregate failed: upstream stream ended without a ` +
+          `terminal event (attempt=${attempt}/${AGGREGATE_MAX_ATTEMPTS}, status=${res.statusCode}, ` +
+          `bytesReceived=${receivedBytes}, tail="${maskedTail}")`
+      )
     }
 
     res.write = function (chunk, encoding, callback) {
@@ -967,17 +1045,51 @@ function patchResponseForAnthropic(res, { model, stream }) {
       }
       ingestSSE(chunkDecoder.end())
       if (buffer.data.trim()) {
-        const completed = extractCompletedFromRawEvent(buffer.data)
-        if (completed) {
-          completedEvent = completed
+        const terminal = extractTerminalEventFromRawEvent(buffer.data)
+        if (terminal) {
+          terminalEvent = terminal
         }
         buffer.data = ''
       }
 
-      if (!completedEvent) {
-        logger.error(
-          '❌ Anthropic bridge non-stream aggregate failed: upstream stream ended without response.completed'
-        )
+      if (!terminalEvent) {
+        logAggregateFailure()
+
+        // S3：第一次失败时透明重试一次上游请求，safe per A4（还没有任何字节下发给客户端）。
+        // res.end 本身必须保持同步：唯一的调用方是 relay 里未 await 的 res.end()（如
+        // openaiResponsesRelayService.js/openaiRoutes.js 各自 stream 'end' 事件回调），
+        // 把这个函数标成 async 只会让重试的 promise 悬空，任何 rejection 都会变成
+        // unhandledRejection 打到 app.js 的 shutdown()。所以重试用 .catch 兜底，
+        // 而不是 await：失败时照样落到下面同一条 502 信封上。
+        if (attempt < AGGREGATE_MAX_ATTEMPTS) {
+          attempt += 1
+          buffer.data = ''
+          chunkDecoder = createChunkDecoder()
+          errorBuffer.data = ''
+          errorDecoder = createChunkDecoder()
+          receivedBytes = 0
+          rawTail = ''
+          const { handleResponses } = require('../routes/openaiRoutes') // lazy require，避免循环加载
+          handleResponses(req, res).catch((error) => {
+            // 双重故障兜底：如果重试已经自己把响应发出去了（再 reject），headersSent
+            // 已经是 true，finishJson→originalJson 会因为头已提交而抛
+            // ERR_HTTP_HEADERS_SENT——那个抛出不会被这个 .catch 接住，又是一次
+            // unhandledRejection，等于在更深一层重现 round 1 的问题
+            if (res.headersSent) {
+              logger.error('❌ Anthropic bridge aggregate retry failed after headers sent:', error)
+              return
+            }
+            logger.error('❌ Anthropic bridge aggregate retry failed:', error)
+            res.statusCode = 502
+            finishJson(
+              buildErrorEnvelope(502, {
+                message: 'Upstream stream ended without response.completed'
+              })
+            )
+          })
+          return
+        }
+
         res.statusCode = 502
         return finishJson(
           buildErrorEnvelope(502, {
@@ -986,13 +1098,7 @@ function patchResponseForAnthropic(res, { model, stream }) {
         )
       }
 
-      try {
-        return finishJson(convertResponseToAnthropic(completedEvent, { model }))
-      } catch (error) {
-        logger.error('❌ Anthropic bridge response conversion failed:', error)
-        res.statusCode = 500
-        return finishJson(buildErrorEnvelope(500, { message: 'Response conversion failed' }))
-      }
+      return finishTerminalEvent(terminalEvent)
     }
     return
   }
@@ -1107,7 +1213,7 @@ async function handleAnthropicToResponses(req, res, vendor) {
     applyGrokHeaders(req, upstreamModel)
   }
 
-  patchResponseForAnthropic(res, { model: requestedModel, stream: isStream })
+  patchResponseForAnthropic(req, res, { model: requestedModel, stream: isStream })
 
   // prompt_cache_key 只在源请求体（客户端的 Anthropic Messages body）里没有这个字段时
   // 才写入——协议目前没有这个字段，这里只是让优先级显式：不覆盖任何客户端自带值。

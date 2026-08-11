@@ -1117,7 +1117,8 @@ describe('anthropicToResponses bridge entry', () => {
     })
   })
 
-  test('returns 502 when a non-stream client request never receives response.completed', async () => {
+  test('returns 502 after one transparent retry when a non-stream client never receives a terminal event', async () => {
+    // S3: 上游反复没有终态事件时，重试一次仍失败才落到 502（首次 + 一次重试 = 2 次上游调用）
     openaiRoutes.handleResponses.mockImplementation(async (req, res) => {
       res.setHeader('Content-Type', 'text/event-stream')
       if (typeof res.flushHeaders === 'function') {
@@ -1138,6 +1139,7 @@ describe('anthropicToResponses bridge entry', () => {
       messages: [{ role: 'user', content: 'say RELAY-OK' }]
     })
     const { res, captured } = createFakeRes()
+    const logger = require('../src/utils/logger')
 
     await handleAnthropicToResponses(req, res, 'codex')
 
@@ -1150,6 +1152,210 @@ describe('anthropicToResponses bridge entry', () => {
         type: 'api_error',
         message: 'Upstream stream ended without response.completed'
       }
+    })
+    // 一次原始尝试 + 一次透明重试
+    expect(openaiRoutes.handleResponses).toHaveBeenCalledTimes(2)
+    // S1：每次失败都记录诊断（状态、字节数、缓冲尾部），而不是静默丢弃
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('attempt=1/2'))
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('attempt=2/2'))
+    for (const call of logger.error.mock.calls) {
+      if (call[0].includes('non-stream aggregate failed')) {
+        expect(call[0]).toEqual(expect.stringContaining('bytesReceived='))
+        expect(call[0]).toEqual(expect.stringContaining('tail='))
+      }
+    }
+  })
+
+  test('retries once and recovers when the second upstream attempt carries response.completed', async () => {
+    // S3: 第一次上游流裸结束，第二次带 response.completed；客户端只看到一次成功响应
+    openaiRoutes.handleResponses
+      .mockImplementationOnce(async (req, res) => {
+        res.setHeader('Content-Type', 'text/event-stream')
+        if (typeof res.flushHeaders === 'function') {
+          res.flushHeaders()
+        }
+        res.write(
+          'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_retry"}}\n\n'
+        )
+        res.end()
+      })
+      .mockImplementationOnce(async (req, res) => {
+        res.setHeader('Content-Type', 'text/event-stream')
+        if (typeof res.flushHeaders === 'function') {
+          res.flushHeaders()
+        }
+        res.write(
+          'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_retry","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"RELAY-OK"}]}],"usage":{"input_tokens":9,"output_tokens":2}}}\n\n'
+        )
+        res.end()
+      })
+
+    const req = createFakeReq({
+      model: 'gpt-5.6-sol',
+      stream: false,
+      messages: [{ role: 'user', content: 'say RELAY-OK' }]
+    })
+    const { res, captured } = createFakeRes()
+
+    await handleAnthropicToResponses(req, res, 'codex')
+
+    expect(openaiRoutes.handleResponses).toHaveBeenCalledTimes(2)
+    expect(res.statusCode).toBe(200)
+    expect(captured.headers['content-type']).toBe('application/json')
+    expect(captured.endCalls).toBe(1)
+    expect(captured.json).toMatchObject({
+      type: 'message',
+      content: [{ type: 'text', text: 'RELAY-OK' }],
+      usage: { input_tokens: 9, output_tokens: 2 }
+    })
+  })
+
+  test('does not leak an unhandled rejection when the retry attempt itself throws, and still returns 502', async () => {
+    // Review blocking finding: res.end must stay sync and .catch the retry, or a
+    // rejected retry becomes an unhandledRejection that hits app.js's shutdown()
+    const retryError = new Error('boom: upstream retry blew up')
+    openaiRoutes.handleResponses
+      .mockImplementationOnce(async (req, res) => {
+        res.setHeader('Content-Type', 'text/event-stream')
+        if (typeof res.flushHeaders === 'function') {
+          res.flushHeaders()
+        }
+        res.write(
+          'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_reject"}}\n\n'
+        )
+        res.end()
+      })
+      .mockRejectedValueOnce(retryError)
+
+    const unhandledRejections = []
+    const onUnhandledRejection = (reason) => unhandledRejections.push(reason)
+    process.on('unhandledRejection', onUnhandledRejection)
+
+    const req = createFakeReq({
+      model: 'gpt-5.6-sol',
+      stream: false,
+      messages: [{ role: 'user', content: 'say RELAY-OK' }]
+    })
+    const { res, captured } = createFakeRes()
+    const logger = require('../src/utils/logger')
+
+    try {
+      await handleAnthropicToResponses(req, res, 'codex')
+      // 给重试的 .catch 微任务一个机会跑完，再断言最终状态
+      await new Promise((resolve) => setImmediate(resolve))
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection)
+    }
+
+    expect(unhandledRejections).toEqual([])
+    expect(openaiRoutes.handleResponses).toHaveBeenCalledTimes(2)
+    expect(res.statusCode).toBe(502)
+    expect(captured.headers['content-type']).toBe('application/json')
+    expect(captured.endCalls).toBe(1)
+    expect(captured.json).toEqual({
+      type: 'error',
+      error: {
+        type: 'api_error',
+        message: 'Upstream stream ended without response.completed'
+      }
+    })
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('Anthropic bridge aggregate retry failed'),
+      retryError
+    )
+  })
+
+  test('maps a non-stream response.incomplete terminal event to max_tokens', async () => {
+    // S2: incomplete 是正常收尾（截断），不是失败；聚合走 convertResponseToAnthropic
+    openaiRoutes.handleResponses.mockImplementation(async (req, res) => {
+      res.setHeader('Content-Type', 'text/event-stream')
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders()
+      }
+      res.write(
+        'event: response.incomplete\ndata: {"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"cut off"}]}],"usage":{"input_tokens":20,"output_tokens":5}}}\n\n'
+      )
+      res.end()
+    })
+
+    const req = createFakeReq({
+      model: 'gpt-5.6-sol',
+      stream: false,
+      messages: [{ role: 'user', content: 'say RELAY-OK' }]
+    })
+    const { res, captured } = createFakeRes()
+
+    await handleAnthropicToResponses(req, res, 'codex')
+
+    expect(openaiRoutes.handleResponses).toHaveBeenCalledTimes(1)
+    expect(res.statusCode).toBe(200)
+    expect(captured.headers['content-type']).toBe('application/json')
+    expect(captured.json).toMatchObject({
+      type: 'message',
+      content: [{ type: 'text', text: 'cut off' }],
+      stop_reason: 'max_tokens'
+    })
+  })
+
+  test('maps a non-stream response.failed terminal event to a 500 error envelope', async () => {
+    // S2: failed 是上游主动报出的失败，不再重试，直接映射成错误信封
+    openaiRoutes.handleResponses.mockImplementation(async (req, res) => {
+      res.setHeader('Content-Type', 'text/event-stream')
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders()
+      }
+      res.write(
+        'event: response.failed\ndata: {"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"message":"upstream blew up"}}}\n\n'
+      )
+      res.end()
+    })
+
+    const req = createFakeReq({
+      model: 'gpt-5.6-sol',
+      stream: false,
+      messages: [{ role: 'user', content: 'say RELAY-OK' }]
+    })
+    const { res, captured } = createFakeRes()
+
+    await handleAnthropicToResponses(req, res, 'codex')
+
+    expect(openaiRoutes.handleResponses).toHaveBeenCalledTimes(1)
+    expect(res.statusCode).toBe(500)
+    expect(captured.headers['content-type']).toBe('application/json')
+    expect(captured.json).toEqual({
+      type: 'error',
+      error: { type: 'api_error', message: 'upstream blew up' }
+    })
+  })
+
+  test('maps a non-stream top-level error terminal event using its own status code', async () => {
+    // S2: error 事件自带 status，映射成对应错误信封（默认 502）
+    openaiRoutes.handleResponses.mockImplementation(async (req, res) => {
+      res.setHeader('Content-Type', 'text/event-stream')
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders()
+      }
+      res.write(
+        'event: error\ndata: {"type":"error","status":429,"error":{"message":"rate limited mid-stream"}}\n\n'
+      )
+      res.end()
+    })
+
+    const req = createFakeReq({
+      model: 'gpt-5.6-sol',
+      stream: false,
+      messages: [{ role: 'user', content: 'say RELAY-OK' }]
+    })
+    const { res, captured } = createFakeRes()
+
+    await handleAnthropicToResponses(req, res, 'codex')
+
+    expect(openaiRoutes.handleResponses).toHaveBeenCalledTimes(1)
+    expect(res.statusCode).toBe(429)
+    expect(captured.headers['content-type']).toBe('application/json')
+    expect(captured.json).toEqual({
+      type: 'error',
+      error: { type: 'rate_limit_error', message: 'rate limited mid-stream' }
     })
   })
 
