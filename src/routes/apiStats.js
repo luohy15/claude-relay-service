@@ -1318,7 +1318,7 @@ router.post('/api-key/test-openai', async (req, res) => {
 // 📊 用户模型统计查询接口 - 安全的自查询接口
 router.post('/api/user-model-stats', async (req, res) => {
   try {
-    const { apiKey, apiId, period = 'monthly' } = req.body
+    const { apiKey, apiId, period = 'monthly', date: requestedDate } = req.body
 
     let keyData
     let keyId
@@ -1403,7 +1403,22 @@ router.post('/api/user-model-stats', async (req, res) => {
 
     let pattern
     let matchRegex
-    if (period === 'daily') {
+    let usageDate = null
+    if (period === 'hourly') {
+      if (requestedDate !== undefined && requestedDate !== null && requestedDate !== '') {
+        if (typeof requestedDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(requestedDate)) {
+          return res.status(400).json({
+            error: 'Invalid date format',
+            message: 'date must be YYYY-MM-DD'
+          })
+        }
+        usageDate = requestedDate
+      } else {
+        usageDate = today
+      }
+      pattern = `usage:${keyId}:model:hourly:*:${usageDate}:*`
+      matchRegex = /usage:.+:model:hourly:(.+):(\d{4}-\d{2}-\d{2}):(\d{2})$/
+    } else if (period === 'daily') {
       pattern = `usage:${keyId}:model:daily:*:${today}`
       matchRegex = /usage:.+:model:daily:(.+):\d{4}-\d{2}-\d{2}$/
     } else if (period === 'alltime') {
@@ -1426,6 +1441,8 @@ router.post('/api/user-model-stats', async (req, res) => {
       }
 
       const model = match[1]
+      const itemUsageDate = period === 'hourly' ? match[2] : null
+      const hour = period === 'hourly' ? parseInt(match[3], 10) : null
 
       if (data && Object.keys(data).length > 0) {
         const ephemeral5m = parseInt(data.ephemeral5mTokens) || 0
@@ -1469,7 +1486,7 @@ router.post('/api/user-model-stats', async (req, res) => {
               usage.cache_read_input_tokens
             : parseInt(data.allTokens) || 0
 
-        modelStats.push({
+        const item = {
           model,
           requests: parseInt(data.requests) || 0,
           inputTokens: usage.input_tokens,
@@ -1481,7 +1498,14 @@ router.post('/api/user-model-stats', async (req, res) => {
           formatted: costData.formatted,
           pricing: costData.pricing,
           isLegacy: !hasStoredCost
-        })
+        }
+
+        if (period === 'hourly') {
+          item.usageDate = itemUsageDate
+          item.hour = hour
+        }
+
+        modelStats.push(item)
       }
     }
 

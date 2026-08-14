@@ -1209,12 +1209,9 @@ class RedisClient {
     pipeline.hincrby(keyModelDaily, 'ephemeral5mTokens', ephemeral5mTokens)
     pipeline.hincrby(keyModelDaily, 'ephemeral1hTokens', ephemeral1hTokens)
     // 费用统计（使用整数存储，单位：微美元，1美元=1000000微美元）
-    if (realCost > 0) {
-      pipeline.hincrby(keyModelDaily, 'realCostMicro', Math.round(realCost * 1000000))
-    }
-    if (ratedCost > 0) {
-      pipeline.hincrby(keyModelDaily, 'ratedCostMicro', Math.round(ratedCost * 1000000))
-    }
+    // 始终写入（含 0）：存储费用为权威来源；缺失字段仅用于部署前遗留数据回退
+    pipeline.hincrby(keyModelDaily, 'realCostMicro', Math.round(realCost * 1000000))
+    pipeline.hincrby(keyModelDaily, 'ratedCostMicro', Math.round(ratedCost * 1000000))
 
     // API Key级别的模型统计 - 每月
     pipeline.hincrby(keyModelMonthly, 'inputTokens', finalInputTokens)
@@ -1285,13 +1282,9 @@ class RedisClient {
     // 详细缓存类型统计
     pipeline.hincrby(keyModelHourly, 'ephemeral5mTokens', ephemeral5mTokens)
     pipeline.hincrby(keyModelHourly, 'ephemeral1hTokens', ephemeral1hTokens)
-    // 费用统计
-    if (realCost > 0) {
-      pipeline.hincrby(keyModelHourly, 'realCostMicro', Math.round(realCost * 1000000))
-    }
-    if (ratedCost > 0) {
-      pipeline.hincrby(keyModelHourly, 'ratedCostMicro', Math.round(ratedCost * 1000000))
-    }
+    // 费用统计：始终写入（含 0），保证 daily/hourly 以存储费用为准
+    pipeline.hincrby(keyModelHourly, 'realCostMicro', Math.round(realCost * 1000000))
+    pipeline.hincrby(keyModelHourly, 'ratedCostMicro', Math.round(ratedCost * 1000000))
 
     // 新增：系统级分钟统计
     pipeline.hincrby(systemMinuteKey, 'requests', 1)
