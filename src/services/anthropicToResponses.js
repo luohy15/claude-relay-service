@@ -386,7 +386,10 @@ function createStreamState(model) {
     messageStarted: false,
     messageStopped: false,
     blockIndex: -1,
-    openBlock: null, // { kind: 'text' | 'tool_use', argsDeltaSeen: boolean }
+    // { kind: 'text' | 'tool_use', itemId?: string, argsDeltaSeen?: boolean }
+    openBlock: null,
+    // call_id / item id already emitted as a tool_use block; close/open is idempotent per id
+    emittedToolUseIds: new Set(),
     toolUseCount: 0
   }
 }
@@ -439,10 +442,33 @@ function ensureTextBlock(state, out) {
   )
 }
 
+function functionCallItemId(item) {
+  return item?.call_id || item?.id || ''
+}
+
+function isOpenToolUseForItem(state, itemId) {
+  return Boolean(
+    state.openBlock &&
+      state.openBlock.kind === 'tool_use' &&
+      (!state.openBlock.itemId || !itemId || state.openBlock.itemId === itemId)
+  )
+}
+
 function openToolUseBlock(item, state, out) {
+  const itemId = functionCallItemId(item)
+  if (itemId && state.emittedToolUseIds.has(itemId)) {
+    return false
+  }
+  if (isOpenToolUseForItem(state, itemId) && itemId && state.openBlock.itemId === itemId) {
+    return true
+  }
+  closeOpenBlock(state, out)
   state.blockIndex += 1
   state.toolUseCount += 1
-  state.openBlock = { kind: 'tool_use', argsDeltaSeen: false }
+  state.openBlock = { kind: 'tool_use', argsDeltaSeen: false, itemId }
+  if (itemId) {
+    state.emittedToolUseIds.add(itemId)
+  }
   out.push(
     sse('content_block_start', {
       type: 'content_block_start',
@@ -455,6 +481,7 @@ function openToolUseBlock(item, state, out) {
       }
     })
   )
+  return true
 }
 
 function emitInputJsonDelta(partialJson, state, out) {
@@ -511,7 +538,6 @@ function convertStreamEvent(eventData, state) {
       const item = eventData.item || {}
       if (item.type === 'function_call') {
         ensureMessageStart(eventData, state, out)
-        closeOpenBlock(state, out)
         openToolUseBlock(item, state, out)
       }
       break
@@ -559,19 +585,32 @@ function convertStreamEvent(eventData, state) {
     case 'response.output_item.done': {
       const item = eventData.item || {}
       if (item.type === 'function_call') {
-        if (!state.openBlock || state.openBlock.kind !== 'tool_use') {
+        const itemId = functionCallItemId(item)
+        if (!isOpenToolUseForItem(state, itemId)) {
+          // 已为该 call_id 发过 tool_use：重复 done 或乱序 message.done 都不再开第二块
+          if (itemId && state.emittedToolUseIds.has(itemId)) {
+            break
+          }
           // 兜底：没收到 added 事件时用完整 item 补一个 tool_use block
           ensureMessageStart(eventData, state, out)
-          closeOpenBlock(state, out)
           openToolUseBlock(item, state, out)
         }
-        if (!state.openBlock.argsDeltaSeen) {
+        if (
+          state.openBlock &&
+          state.openBlock.kind === 'tool_use' &&
+          !state.openBlock.argsDeltaSeen
+        ) {
           state.openBlock.argsDeltaSeen = true
           emitInputJsonDelta(item.arguments || '{}', state, out)
         }
-        closeOpenBlock(state, out)
+        if (isOpenToolUseForItem(state, itemId)) {
+          closeOpenBlock(state, out)
+        }
       } else if (item.type === 'message') {
-        closeOpenBlock(state, out)
+        // 只关 text：Grok 会在 function_call 已 added 之后才补 message.done
+        if (state.openBlock && state.openBlock.kind === 'text') {
+          closeOpenBlock(state, out)
+        }
       }
       break
     }

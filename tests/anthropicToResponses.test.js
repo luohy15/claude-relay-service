@@ -484,6 +484,106 @@ describe('anthropicToResponses stream converter', () => {
     expect(deltas[0].data.delta.partial_json).toBe('{"command":"ls"}')
   })
 
+  test('does not duplicate tool_use when message.done arrives after function_call.added', () => {
+    const events = runStream(
+      [
+        { type: 'response.created', response: { id: 'resp_1' } },
+        { type: 'response.output_item.added', item: { type: 'message' } },
+        { type: 'response.output_text.delta', delta: 'I will update the todo.' },
+        {
+          type: 'response.output_item.added',
+          item: { type: 'function_call', call_id: 'call-X', name: 'Bash' }
+        },
+        {
+          type: 'response.function_call_arguments.delta',
+          delta: '{"command":"y todo update"}'
+        },
+        { type: 'response.output_item.done', item: { type: 'message' } },
+        {
+          type: 'response.output_item.done',
+          item: {
+            type: 'function_call',
+            call_id: 'call-X',
+            name: 'Bash',
+            arguments: '{"command":"y todo update"}'
+          }
+        },
+        { type: 'response.completed', response: { id: 'resp_1', usage: {} } }
+      ],
+      'grok-4.6'
+    )
+
+    const toolStarts = events.filter(
+      (e) => e.event === 'content_block_start' && e.data.content_block?.type === 'tool_use'
+    )
+    expect(toolStarts).toHaveLength(1)
+    expect(toolStarts[0].data.content_block.id).toBe('call-X')
+    expect(
+      events
+        .filter((e) => e.data.delta?.type === 'input_json_delta')
+        .map((e) => e.data.delta.partial_json)
+        .join('')
+    ).toBe('{"command":"y todo update"}')
+    expect(events.filter((e) => e.event === 'content_block_start')).toHaveLength(2)
+    expect(events[events.length - 2].data.delta.stop_reason).toBe('tool_use')
+  })
+
+  test('does not reopen tool_use when function_call.done is repeated', () => {
+    const events = runStream(
+      [
+        { type: 'response.created', response: { id: 'resp_dup' } },
+        {
+          type: 'response.output_item.added',
+          item: { type: 'function_call', call_id: 'call-X', name: 'Bash' }
+        },
+        {
+          type: 'response.function_call_arguments.delta',
+          delta: '{"command":"y todo get 3308"}'
+        },
+        {
+          type: 'response.output_item.done',
+          item: {
+            type: 'function_call',
+            call_id: 'call-X',
+            name: 'Bash',
+            arguments: '{"command":"y todo get 3308"}'
+          }
+        },
+        {
+          type: 'response.output_item.done',
+          item: {
+            type: 'function_call',
+            call_id: 'call-X',
+            name: 'Bash',
+            arguments: '{"command":"y todo get 3308"}'
+          }
+        },
+        { type: 'response.completed', response: { id: 'resp_dup', usage: {} } }
+      ],
+      'grok-4.6'
+    )
+
+    const toolStarts = events.filter(
+      (e) => e.event === 'content_block_start' && e.data.content_block?.type === 'tool_use'
+    )
+    expect(toolStarts).toHaveLength(1)
+    expect(toolStarts[0].data.content_block.id).toBe('call-X')
+    expect(
+      events
+        .filter((e) => e.data.delta?.type === 'input_json_delta')
+        .map((e) => e.data.delta.partial_json)
+        .join('')
+    ).toBe('{"command":"y todo get 3308"}')
+    expect(events.map((e) => e.event)).toEqual([
+      'message_start',
+      'content_block_start',
+      'content_block_delta',
+      'content_block_stop',
+      'message_delta',
+      'message_stop'
+    ])
+  })
+
   test('maps incomplete responses to max_tokens and closes an empty stream', () => {
     const events = runStream(
       [
