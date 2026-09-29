@@ -5,6 +5,8 @@ const DEFAULT_MAX_ARRAY_ITEMS = 24
 const DEFAULT_MAX_DEPTH = 6
 const DEFAULT_MAX_TOTAL_CHARS = 12000
 const ENCRYPTED_CONTENT_KEY = 'encrypted_content'
+// Anthropic 桥接写进 redacted_thinking.data 的 grok reasoning 封装（todo 3733）
+const BRIDGE_REASONING_PREFIX = 'crsr1.'
 const TOOLS_KEY = 'tools'
 const PREVIEW_TRUNCATION_SUFFIX_PATTERN = /\.\.\.\[(?:truncated )?(\d+) chars\]$/
 const OPENAI_RELATED_ACCOUNT_TYPES = new Set(['openai', 'openai-responses', 'azure-openai', 'grok'])
@@ -399,6 +401,9 @@ function sanitizeValue(value, ctx) {
   if (typeof value === 'string') {
     if (SENSITIVE_KEY_PATTERN.test(keyPath)) {
       return maskSensitiveValue(value)
+    }
+    if (value.startsWith(BRIDGE_REASONING_PREFIX)) {
+      return createOmittedValue(value)
     }
     return truncateString(value, maxStringChars)
   }

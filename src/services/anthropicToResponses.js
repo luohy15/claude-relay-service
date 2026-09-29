@@ -14,14 +14,21 @@
  * thinking block 生成合法的 Anthropic signature，而"Claude Code 能容忍无签名 thinking block"
  * 这一假设尚未验证（plan 2972 假设 3）。不发 thinking block 一定是合法的 Anthropic 流，
  * 代价只是客户端看不到上游的思考摘要。
+ *
+ * 例外（todo 3733，仅 grok）：grok-4.7 在历史 reasoning 不回传时会从第 3 个工具轮起停止推理。
+ * 所以 grok 路径请求 reasoning.encrypted_content，把每个上游 reasoning item 封装成 Anthropic
+ * redacted_thinking block（不透明、无签名、客户端原样回传）下发，下一轮再按原位置还原成
+ * Responses reasoning item。封装格式见 encodeReasoningEnvelope；回放只绑定到实际选中的账户。
  */
 
+const crypto = require('crypto')
 const { StringDecoder } = require('string_decoder')
 const logger = require('../utils/logger')
 const metadataUserIdHelper = require('../utils/metadataUserIdHelper')
 const { stripModelCapabilitySuffix } = require('../utils/modelHelper')
 const { removeBillingHeaderFromSystem } = require('../utils/billingHeader')
 const { maskToken } = require('../utils/tokenMask')
+const { maskReasoningPayload } = require('../utils/reasoningPayloadMask')
 
 // 显式 x-session-id 头的保守校验：这个值会原样转发进上游 header（openaiRoutes.js 的
 // header 白名单），不能让客户端往上游请求头里塞任意内容
@@ -48,6 +55,213 @@ const DROPPED_REASONING_EVENTS = new Set([
   'response.reasoning_text.delta',
   'response.reasoning_text.done'
 ])
+
+// =============================================
+// grok reasoning 封装（redacted_thinking.data）
+// =============================================
+
+// data = 'crsr1.' + base64url(JSON {v, vendor, acct, id, enc}) + '.' + mac
+// mac 覆盖前缀和整段载荷：客户端改动任一字段（包括把 acct 换成别的账户）都会被静默丢弃
+const REASONING_ENVELOPE_PREFIX = 'crsr1.'
+const REASONING_ENVELOPE_VENDOR = 'grok'
+const REASONING_MAX_ID_CHARS = 256
+// 单条与整轮回放共用的 encrypted_content 上限
+const REASONING_MAX_ENC_BYTES = 512 * 1024
+// 解码前的整体长度闸：base64 膨胀 4/3 后再留余量，超长直接丢，不做 base64/JSON 解析
+const REASONING_MAX_ENVELOPE_CHARS = Math.ceil(((REASONING_MAX_ENC_BYTES + 4096) * 4) / 3) + 64
+const REASONING_REPLAY_MAX_ITEMS = 16
+
+function reasoningHmac(label, value) {
+  // lazy require：只有 grok reasoning 路径需要密钥
+  const config = require('../../config/config')
+  return crypto
+    .createHmac('sha256', String(config.security?.encryptionKey || ''))
+    .update(`${label}:${value}`)
+    .digest('base64url')
+}
+
+/**
+ * 上游账户 id → 短指纹（不在客户端 transcript 里暴露原始账户 id）
+ * @param {string} accountId
+ * @returns {string}
+ */
+function accountFingerprint(accountId) {
+  return reasoningHmac('crsr1-acct', accountId).slice(0, 16)
+}
+
+function reasoningEnvelopeMac(signedPart) {
+  return reasoningHmac('crsr1-mac', signedPart).slice(0, 22)
+}
+
+/**
+ * @param {Object} fields - { acct, id, enc }（vendor 仅供测试覆盖，默认 grok）
+ * @returns {string} redacted_thinking.data
+ */
+function encodeReasoningEnvelope({ acct, id, enc, vendor = REASONING_ENVELOPE_VENDOR }) {
+  const payload = Buffer.from(JSON.stringify({ v: 1, vendor, acct, id, enc })).toString('base64url')
+  const signedPart = `${REASONING_ENVELOPE_PREFIX}${payload}`
+  return `${signedPart}.${reasoningEnvelopeMac(signedPart)}`
+}
+
+/**
+ * @param {*} data - redacted_thinking.data
+ * @returns {{acct: string, id: string, enc: string}|null} 任何不合规（前缀、长度、MAC、形状）都返回 null
+ */
+function decodeReasoningEnvelope(data) {
+  if (
+    typeof data !== 'string' ||
+    !data.startsWith(REASONING_ENVELOPE_PREFIX) ||
+    data.length > REASONING_MAX_ENVELOPE_CHARS
+  ) {
+    return null
+  }
+  const macIndex = data.lastIndexOf('.')
+  if (macIndex <= REASONING_ENVELOPE_PREFIX.length) {
+    return null
+  }
+  const signedPart = data.slice(0, macIndex)
+  const mac = Buffer.from(data.slice(macIndex + 1))
+  const expected = Buffer.from(reasoningEnvelopeMac(signedPart))
+  if (mac.length !== expected.length || !crypto.timingSafeEqual(mac, expected)) {
+    return null
+  }
+
+  let parsed
+  try {
+    parsed = JSON.parse(
+      Buffer.from(signedPart.slice(REASONING_ENVELOPE_PREFIX.length), 'base64url').toString('utf8')
+    )
+  } catch (error) {
+    return null
+  }
+  const { v, vendor, acct, id, enc } = parsed || {}
+  if (
+    v !== 1 ||
+    vendor !== REASONING_ENVELOPE_VENDOR ||
+    typeof acct !== 'string' ||
+    !acct ||
+    typeof id !== 'string' ||
+    !id ||
+    id.length > REASONING_MAX_ID_CHARS ||
+    typeof enc !== 'string' ||
+    !enc ||
+    Buffer.byteLength(enc, 'utf8') > REASONING_MAX_ENC_BYTES
+  ) {
+    return null
+  }
+  return { acct, id, enc }
+}
+
+function isBridgeReasoningBlock(block) {
+  return (
+    block?.type === 'redacted_thinking' &&
+    typeof block.data === 'string' &&
+    block.data.startsWith(REASONING_ENVELOPE_PREFIX)
+  )
+}
+
+/**
+ * 原生 Claude 路径：删掉桥接产生的 redacted_thinking（Anthropic 无法解密它们，会整请求拒绝）。
+ * 只动 crsr1. 前缀的块；删空的 assistant 消息整条移除，而不是发出空 content。
+ * @param {Object} body - Anthropic Messages 请求体（原地修改）
+ * @returns {number} 删除的块数
+ */
+function stripBridgeReasoningBlocks(body) {
+  if (!body || !Array.isArray(body.messages)) {
+    return 0
+  }
+  let stripped = 0
+  const messages = []
+  for (const message of body.messages) {
+    if (!Array.isArray(message?.content) || !message.content.some(isBridgeReasoningBlock)) {
+      messages.push(message)
+      continue
+    }
+    const content = message.content.filter((block) => !isBridgeReasoningBlock(block))
+    stripped += message.content.length - content.length
+    if (content.length > 0) {
+      messages.push({ ...message, content })
+    }
+  }
+  if (stripped > 0) {
+    body.messages = messages
+  }
+  return stripped
+}
+
+// 当前 agentic 轮 = 最后一条"真正的用户消息"之后的部分。只含 tool_result 的 user 消息，
+// 或 tool_result 旁边夹带文本（Claude Code 的 system-reminder）的，都不算新一轮；
+// Claude Code 在工具轮之间插入的 role:'system' 消息（环境信息、token 余量）也不算
+function isUserTurnBoundary(message) {
+  if (message?.role !== 'user') {
+    return false
+  }
+  const { content } = message || {}
+  return !Array.isArray(content) || !content.some((block) => block?.type === 'tool_result')
+}
+
+/**
+ * 选出本轮可回放的 reasoning：只看当前 agentic 轮、只认本账户指纹、最新 16 条、
+ * encrypted_content 合计不超过 512 KB（超出时从最旧的开始丢）
+ * @returns {{items: Map<Object, Object>, stats: Object}} items: 源 block → Responses reasoning item
+ */
+function selectReplayReasoning(messages, acctFp) {
+  const stats = { replayed: 0, invalid: 0, otherAccount: 0, priorTurn: 0, overCap: 0 }
+  const items = new Map()
+  if (!acctFp || !Array.isArray(messages)) {
+    return { items, stats }
+  }
+
+  let turnStart = 0
+  messages.forEach((message, index) => {
+    if (isUserTurnBoundary(message)) {
+      turnStart = index + 1
+    }
+  })
+
+  const candidates = []
+  messages.forEach((message, index) => {
+    if (message?.role !== 'assistant' || !Array.isArray(message.content)) {
+      return
+    }
+    for (const block of message.content) {
+      if (!isBridgeReasoningBlock(block)) {
+        continue
+      }
+      if (index < turnStart) {
+        stats.priorTurn += 1
+        continue
+      }
+      const envelope = decodeReasoningEnvelope(block.data)
+      if (!envelope) {
+        stats.invalid += 1
+      } else if (envelope.acct !== acctFp) {
+        stats.otherAccount += 1
+      } else {
+        candidates.push({ block, envelope })
+      }
+    }
+  })
+
+  let totalBytes = 0
+  for (let i = candidates.length - 1; i >= 0; i -= 1) {
+    const { block, envelope } = candidates[i]
+    const bytes = Buffer.byteLength(envelope.enc, 'utf8')
+    if (items.size >= REASONING_REPLAY_MAX_ITEMS || totalBytes + bytes > REASONING_MAX_ENC_BYTES) {
+      stats.overCap = i + 1
+      break
+    }
+    totalBytes += bytes
+    items.set(block, {
+      type: 'reasoning',
+      id: envelope.id,
+      summary: [],
+      encrypted_content: envelope.enc
+    })
+  }
+  stats.replayed = items.size
+  return { items, stats }
+}
 
 // =============================================
 // 请求转换: Anthropic Messages → Responses
@@ -109,7 +323,12 @@ function stringifyToolResult(content) {
   return JSON.stringify(content)
 }
 
-function buildInputItems(messages) {
+/**
+ * @param {Array} messages
+ * @param {Map<Object, Object>} [replayReasoning] - selectReplayReasoning().items；只有其中的
+ *   redacted_thinking 会还原成 reasoning item，其它一律按原逻辑丢弃
+ */
+function buildInputItems(messages, replayReasoning = new Map()) {
   const input = []
 
   for (const message of messages || []) {
@@ -178,8 +397,17 @@ function buildInputItems(messages) {
           })
           break
 
+        case 'redacted_thinking':
+          // 仅 grok 选中的本轮封装块还原成 reasoning item，放在原位置（先 flush，保证它
+          // 排在它产生的 function_call 之前）；其它（原生 Anthropic 块、别的账户）丢弃
+          if (replayReasoning.has(block)) {
+            flushParts()
+            input.push(replayReasoning.get(block))
+          }
+          break
+
         default:
-          // thinking / redacted_thinking / document 等：Responses 无对应结构，丢弃
+          // thinking / document 等：Responses 无对应结构，丢弃
           break
       }
     }
@@ -251,6 +479,7 @@ function mapReasoningEffort(body) {
  * @param {Object} anthropicBody - Anthropic /v1/messages 请求体
  * @param {Object} [options]
  * @param {string} [options.vendor] - 'codex' | 'grok'
+ * @param {string} [options.acctFp] - grok：实际选中账户的指纹；缺省时不回放任何 reasoning
  * @returns {Object} Responses 请求体
  */
 function buildResponsesRequestFromAnthropic(anthropicBody = {}, options = {}) {
@@ -268,7 +497,9 @@ function buildResponsesRequestFromAnthropic(anthropicBody = {}, options = {}) {
     result.instructions = instructions
   }
 
-  result.input = buildInputItems(anthropicBody.messages)
+  const replay =
+    vendor === 'grok' ? selectReplayReasoning(anthropicBody.messages, options.acctFp) : null
+  result.input = buildInputItems(anthropicBody.messages, replay?.items)
 
   const tools = buildTools(anthropicBody.tools)
   if (tools.length > 0) {
@@ -290,6 +521,8 @@ function buildResponsesRequestFromAnthropic(anthropicBody = {}, options = {}) {
     // 所以这里自己保持同样的字段纪律，并按 Codex CLI 的请求形状带上 include。
     result.include = ['reasoning.encrypted_content']
   } else {
+    // 让上游在 reasoning item 上带回 encrypted_content，下一轮原样回放（todo 3733）
+    result.include = ['reasoning.encrypted_content']
     if (anthropicBody.max_tokens > 0) {
       result.max_output_tokens = anthropicBody.max_tokens
     }
@@ -379,9 +612,18 @@ function buildErrorEnvelope(statusCode, data) {
   }
 }
 
-function createStreamState(model) {
+/**
+ * @param {string} model
+ * @param {Object} [reasoning] - { vendor, acctFp }：grok 且已知账户时才下发 redacted_thinking。
+ *   传入的是共享对象，账户在流开始前由 openaiRoutes 的选号钩子写入
+ */
+function createStreamState(model, reasoning = null) {
   return {
     model: model || '',
+    reasoning,
+    // tool_use 块打开期间到达的 reasoning：不能截断参数流，等它关闭后再下发
+    pendingReasoningBlocks: [],
+    reasoningBlockCount: 0,
     messageId: '',
     messageStarted: false,
     messageStopped: false,
@@ -424,6 +666,52 @@ function closeOpenBlock(state, out) {
   }
   out.push(sse('content_block_stop', { type: 'content_block_stop', index: state.blockIndex }))
   state.openBlock = null
+  flushPendingReasoning(state, out)
+}
+
+/**
+ * 上游 reasoning item → redacted_thinking block（仅 grok 且已知账户指纹）
+ * @returns {Object|null}
+ */
+function toRedactedThinkingBlock(item, reasoning) {
+  if (
+    reasoning?.vendor !== 'grok' ||
+    !reasoning.acctFp ||
+    item?.type !== 'reasoning' ||
+    typeof item.encrypted_content !== 'string' ||
+    !item.encrypted_content ||
+    typeof item.id !== 'string' ||
+    !item.id
+  ) {
+    return null
+  }
+  return {
+    type: 'redacted_thinking',
+    data: encodeReasoningEnvelope({
+      acct: reasoning.acctFp,
+      id: item.id,
+      enc: item.encrypted_content
+    })
+  }
+}
+
+function emitRedactedThinkingBlock(block, state, out) {
+  state.blockIndex += 1
+  state.reasoningBlockCount += 1
+  out.push(
+    sse('content_block_start', {
+      type: 'content_block_start',
+      index: state.blockIndex,
+      content_block: block
+    })
+  )
+  out.push(sse('content_block_stop', { type: 'content_block_stop', index: state.blockIndex }))
+}
+
+function flushPendingReasoning(state, out) {
+  while (state.pendingReasoningBlocks.length > 0) {
+    emitRedactedThinkingBlock(state.pendingReasoningBlocks.shift(), state, out)
+  }
 }
 
 function ensureTextBlock(state, out) {
@@ -496,8 +784,8 @@ function emitInputJsonDelta(partialJson, state, out) {
 
 function emitMessageEnd(resp, state, out) {
   closeOpenBlock(state, out)
-  // 一条没有任何内容块的 Anthropic message 不是客户端预期的形状，补一个空 text block
-  if (state.blockIndex < 0) {
+  // 一条没有任何内容块（redacted_thinking 不算）的 Anthropic message 不是客户端预期的形状，补一个空 text block
+  if (state.blockIndex + 1 === state.reasoningBlockCount) {
     ensureTextBlock(state, out)
     closeOpenBlock(state, out)
   }
@@ -611,6 +899,18 @@ function convertStreamEvent(eventData, state) {
         if (state.openBlock && state.openBlock.kind === 'text') {
           closeOpenBlock(state, out)
         }
+      } else if (item.type === 'reasoning') {
+        const block = toRedactedThinkingBlock(item, state.reasoning)
+        if (!block) {
+          break
+        }
+        ensureMessageStart(eventData, state, out)
+        if (state.openBlock && state.openBlock.kind === 'tool_use') {
+          state.pendingReasoningBlocks.push(block)
+          break
+        }
+        closeOpenBlock(state, out)
+        emitRedactedThinkingBlock(block, state, out)
       }
       break
     }
@@ -662,6 +962,7 @@ function finalizeStream(state) {
  * @param {Object} responseData - Responses 响应对象，或 { type: 'response.completed' | 'response.incomplete', response }
  * @param {Object} [options]
  * @param {string} [options.model] - 请求侧模型名（回显给客户端）
+ * @param {Object} [options.reasoning] - 同 createStreamState 的 reasoning
  * @returns {Object} Anthropic Message 或错误信封
  */
 function convertResponseToAnthropic(responseData, options = {}) {
@@ -697,11 +998,16 @@ function convertResponseToAnthropic(responseData, options = {}) {
         input = {}
       }
       content.push({ type: 'tool_use', id: item.call_id || item.id, name: item.name, input })
+    } else if (item.type === 'reasoning') {
+      // 见文件头注释：只有 grok 的 encrypted reasoning 以 redacted_thinking 下发
+      const block = toRedactedThinkingBlock(item, options.reasoning)
+      if (block) {
+        content.push(block)
+      }
     }
-    // reasoning item：见文件头注释，不下发 thinking block
   }
 
-  if (content.length === 0) {
+  if (content.every((block) => block.type === 'redacted_thinking')) {
     content.push({ type: 'text', text: '' })
   }
 
@@ -923,9 +1229,12 @@ const SENSITIVE_INLINE_PATTERN =
   /((?:bearer\s+|"?(?:api[-_]?key|access[-_]?token|refresh[-_]?token|authorization)"?\s*[:=]\s*"?))([A-Za-z0-9_\-.]{8,})/gi
 
 function maskSensitiveInline(text) {
-  return text.replace(
-    SENSITIVE_INLINE_PATTERN,
-    (match, prefix, secret) => `${prefix}${maskToken(secret)}`
+  // encrypted_content / crsr1. 载荷的遮蔽规则和 logger.safeStringify 共用一份（todo 3733 review）
+  return maskReasoningPayload(
+    text.replace(
+      SENSITIVE_INLINE_PATTERN,
+      (match, prefix, secret) => `${prefix}${maskToken(secret)}`
+    )
   )
 }
 
@@ -937,8 +1246,9 @@ function maskSensitiveInline(text) {
  *   所以这里缓冲上游 SSE，抽出终态事件，再 convertResponseToAnthropic 一次写出。
  * @param {Object} req - 重试时需要重新调用 openaiRoutes.handleResponses(req, res)
  * @param {Object} res
+ * @param {Object} options - { model, stream, reasoning }，reasoning 见 createStreamState
  */
-function patchResponseForAnthropic(req, res, { model, stream }) {
+function patchResponseForAnthropic(req, res, { model, stream, reasoning = null }) {
   const originalJson = res.json.bind(res)
   const originalWrite = res.write.bind(res)
   const originalEnd = res.end.bind(res)
@@ -951,7 +1261,7 @@ function patchResponseForAnthropic(req, res, { model, stream }) {
       return originalJson(buildErrorEnvelope(res.statusCode, data))
     }
     try {
-      return originalJson(convertResponseToAnthropic(data, { model }))
+      return originalJson(convertResponseToAnthropic(data, { model, reasoning }))
     } catch (error) {
       logger.error('❌ Anthropic bridge response conversion failed:', error)
       return originalJson(buildErrorEnvelope(500, { message: 'Response conversion failed' }))
@@ -1036,7 +1346,7 @@ function patchResponseForAnthropic(req, res, { model, stream }) {
           res.statusCode = status
           return finishJson(buildErrorEnvelope(status, event))
         }
-        return finishJson(convertResponseToAnthropic(event, { model }))
+        return finishJson(convertResponseToAnthropic(event, { model, reasoning }))
       } catch (error) {
         logger.error('❌ Anthropic bridge response conversion failed:', error)
         res.statusCode = 500
@@ -1142,7 +1452,7 @@ function patchResponseForAnthropic(req, res, { model, stream }) {
     return
   }
 
-  const state = createStreamState(model)
+  const state = createStreamState(model, reasoning)
   const buffer = { data: '' }
   const chunkDecoder = createChunkDecoder()
 
@@ -1252,12 +1562,31 @@ async function handleAnthropicToResponses(req, res, vendor) {
     applyGrokHeaders(req, upstreamModel)
   }
 
-  patchResponseForAnthropic(req, res, { model: requestedModel, stream: isStream })
+  // grok reasoning 回放 / 下发都绑定到实际选中的账户：账户在 openaiRoutes.handleResponses
+  // 里才确定，所以这里只建共享上下文，由选号钩子填入指纹。选号前不回放任何 reasoning。
+  const reasoning = vendor === 'grok' ? { vendor, acctFp: null } : null
+  patchResponseForAnthropic(req, res, { model: requestedModel, stream: isStream, reasoning })
 
   // prompt_cache_key 只在源请求体（客户端的 Anthropic Messages body）里没有这个字段时
   // 才写入——协议目前没有这个字段，这里只是让优先级显式：不覆盖任何客户端自带值。
   const clientPromptCacheKey = anthropicBody.prompt_cache_key
   req.body = buildResponsesRequestFromAnthropic(anthropicBody, { vendor })
+
+  if (reasoning) {
+    // 每次选号（含非流式聚合的重试）都从 transcript 重新计算，同账户同输入得到逐字节相同的 input
+    req._bridgeAccountSelected = (accountType, accountId) => {
+      reasoning.acctFp = accountType === 'grok' && accountId ? accountFingerprint(accountId) : null
+      const { items, stats } = selectReplayReasoning(anthropicBody.messages, reasoning.acctFp)
+      req.body.input = buildInputItems(anthropicBody.messages, items)
+      if (Object.values(stats).some((count) => count > 0)) {
+        logger.info(
+          `🌉 Anthropic bridge grok reasoning replay: replayed=${stats.replayed}, ` +
+            `dropped priorTurn=${stats.priorTurn} otherAccount=${stats.otherAccount} ` +
+            `invalid=${stats.invalid} overCap=${stats.overCap}`
+        )
+      }
+    }
+  }
   req.body.prompt_cache_key = clientPromptCacheKey || sessionHash
   req.body.stream = true
   // 载荷已是 Responses 格式，路径必须与之匹配（req.path 是只读 getter，派生自 req.url）
@@ -1285,5 +1614,9 @@ module.exports = {
   convertResponseToAnthropic,
   buildErrorEnvelope,
   estimateInputTokens,
-  handleAnthropicToResponses
+  handleAnthropicToResponses,
+  encodeReasoningEnvelope,
+  decodeReasoningEnvelope,
+  accountFingerprint,
+  stripBridgeReasoningBlocks
 }

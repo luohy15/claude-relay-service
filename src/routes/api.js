@@ -36,7 +36,8 @@ const {
 const {
   handleAnthropicToResponses,
   estimateInputTokens,
-  buildErrorEnvelope
+  buildErrorEnvelope,
+  stripBridgeReasoningBlocks
 } = require('../services/anthropicToResponses')
 const router = express.Router()
 
@@ -182,6 +183,8 @@ async function handleMessagesRequest(req, res) {
     // 必须在 Claude 权限校验之前：OpenRouter 的 cr_ key 只有 openai 权限，否则会被 403。
     if (req.baseUrl === '/api' && !forcedVendor && !isNativeModelPrefix(upstreamModel)) {
       req._fromUnifiedEndpoint = true
+      // transcript 从 grok/codex 桥接切到 OpenRouter 时，桥接写入的 redacted_thinking 对方无法解密（todo 3733）
+      stripBridgeReasoningBlocks(req.body)
       const openaiRoutes = require('./openaiRoutes') // lazy require, avoid app.js circular load
       return await openaiRoutes.handleResponses(req, res)
     }
@@ -234,6 +237,14 @@ async function handleMessagesRequest(req, res) {
         error: 'Invalid request',
         message: 'Messages array cannot be empty'
       })
+    }
+
+    // transcript 从 grok 桥接切到原生 Claude 时，桥接写入的 redacted_thinking 原生上游无法解密
+    const strippedReasoningBlocks = stripBridgeReasoningBlocks(req.body)
+    if (strippedReasoningBlocks > 0) {
+      logger.info(
+        `🧹 Stripped ${strippedReasoningBlocks} bridge reasoning block(s) for native Claude`
+      )
     }
 
     // 模型限制（黑名单）校验：统一在此处处理（去除供应商前缀）
@@ -1774,6 +1785,8 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
   if (requiredService === 'openai') {
     return res.status(200).json({ input_tokens: estimateInputTokens(req.body) })
   }
+
+  stripBridgeReasoningBlocks(req.body)
 
   // 🔗 会话绑定验证（与 messages 端点保持一致）
   const originalSessionId = claudeRelayConfigService.extractOriginalSessionId(req.body)

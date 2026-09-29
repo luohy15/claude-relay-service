@@ -5,6 +5,12 @@ const { formatDateWithTimezone } = require('../utils/dateHelper')
 const path = require('path')
 const fs = require('fs')
 const os = require('os')
+const {
+  maskReasoningPayload,
+  sanitizeStringValue,
+  REDACTED_STRING_KEYS,
+  REDACTED_STRING_PREFIX
+} = require('./reasoningPayloadMask')
 
 // 安全的 JSON 序列化函数，处理循环引用和特殊字符
 const safeStringify = (obj, maxDepth = Infinity) => {
@@ -17,9 +23,12 @@ const safeStringify = (obj, maxDepth = Infinity) => {
 
     // 处理字符串值，清理可能导致JSON解析错误的特殊字符
     if (typeof value === 'string') {
+      if (REDACTED_STRING_KEYS.has(key) || value.startsWith(REDACTED_STRING_PREFIX)) {
+        return `[redacted ${value.length} chars]`
+      }
       try {
         // 移除或转义可能导致JSON解析错误的字符
-        const cleanValue = value
+        const cleanValue = maskReasoningPayload(value)
           // eslint-disable-next-line no-control-regex
           .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '') // 移除控制字符
           .replace(/[\uD800-\uDFFF]/g, '') // 移除孤立的代理对字符
@@ -129,7 +138,8 @@ const createConsoleFormat = () =>
       // 时间戳只取时分秒
       const shortTime = timestamp ? timestamp.split(' ').pop() : ''
 
-      let logMessage = `${shortTime} ${message}`
+      // review round 2 残留项：console 之前只脱敏 metadata，message/stack 是原样拼接的
+      let logMessage = `${shortTime} ${maskReasoningPayload(message)}`
 
       // 收集要显示的 metadata
       const entries = Object.entries(rest).filter(([k]) => !CONSOLE_SKIP_KEYS.has(k))
@@ -139,14 +149,18 @@ const createConsoleFormat = () =>
         entries.forEach(([key, value], i) => {
           const isLast = i === entries.length - 1
           const branch = isLast ? '└─' : '├─'
+          // review round 3：非对象 metadata 值之前直接 String(value)，绕过了 key 名/crsr1.
+          // 整段遮蔽和 maskReasoningPayload 的内嵌遮蔽，两者都要走 sanitizeStringValue
           const displayValue =
-            value !== null && typeof value === 'object' ? safeStringify(value) : String(value)
+            value !== null && typeof value === 'object'
+              ? safeStringify(value)
+              : sanitizeStringValue(key, value)
           logMessage += `\n${indent}${branch} ${key}: ${displayValue}`
         })
       }
 
       if (stack) {
-        logMessage += `\n${stack}`
+        logMessage += `\n${maskReasoningPayload(stack)}`
       }
       return logMessage
     })

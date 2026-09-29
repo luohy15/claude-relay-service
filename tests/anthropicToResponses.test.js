@@ -212,7 +212,8 @@ describe('anthropicToResponses request converter', () => {
     // grok 上游接受这些字段，显式给出，避免落到它自己的默认值
     expect(result.max_output_tokens).toBe(1024)
     expect(result.temperature).toBe(1)
-    expect(result.include).toBeUndefined()
+    // todo 3733: grok 也请求 encrypted reasoning，供下一轮回放
+    expect(result.include).toEqual(['reasoning.encrypted_content'])
   })
 
   test('converts image blocks, tools and tool_choice', () => {

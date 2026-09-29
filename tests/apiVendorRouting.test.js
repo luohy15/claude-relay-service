@@ -58,7 +58,8 @@ jest.mock('../src/services/anthropicToResponses', () => ({
   buildErrorEnvelope: jest.fn((status, { message }) => ({
     type: 'error',
     error: { type: 'error', message }
-  }))
+  })),
+  stripBridgeReasoningBlocks: jest.fn(() => 0)
 }))
 jest.mock('../src/routes/openaiRoutes', () => ({
   handleResponses: jest.fn(async (_req, res) => res.status(200).json({ ok: true }))
@@ -67,7 +68,8 @@ jest.mock('../src/routes/openaiRoutes', () => ({
 const apiKeyService = require('../src/services/apiKeyService')
 const {
   handleAnthropicToResponses,
-  estimateInputTokens
+  estimateInputTokens,
+  stripBridgeReasoningBlocks
 } = require('../src/services/anthropicToResponses')
 const openaiRoutes = require('../src/routes/openaiRoutes')
 const claudeRelayConfigService = require('../src/services/claudeRelayConfigService')
@@ -131,7 +133,20 @@ describe('handleMessagesRequest vendor routing on the unified /api mount', () =>
     expect(req._fromUnifiedEndpoint).toBe(true)
   })
 
-  it('rule 2: gpt-* takes the codex bridge branch', async () => {
+  it('rule 1: the OpenRouter branch strips bridge reasoning blocks before delegating (review finding 2)', async () => {
+    const req = createRequest({ baseUrl: '/api', model: 'moonshotai/kimi-k3' })
+    const res = createResponse()
+
+    await handleMessagesRequest(req, res)
+
+    expect(stripBridgeReasoningBlocks).toHaveBeenCalledWith(req.body)
+    // 剥离必须发生在委托之前：转发出去的 req.body 已不含桥接 reasoning 块
+    expect(stripBridgeReasoningBlocks.mock.invocationCallOrder[0]).toBeLessThan(
+      openaiRoutes.handleResponses.mock.invocationCallOrder[0]
+    )
+  })
+
+  it('rule 2: gpt-* takes the codex bridge branch and does not strip reasoning blocks', async () => {
     const req = createRequest({ baseUrl: '/api', model: 'gpt-5.6-sol' })
     const res = createResponse()
 
@@ -139,9 +154,10 @@ describe('handleMessagesRequest vendor routing on the unified /api mount', () =>
 
     expect(handleAnthropicToResponses).toHaveBeenCalledWith(req, res, 'codex')
     expect(openaiRoutes.handleResponses).not.toHaveBeenCalled()
+    expect(stripBridgeReasoningBlocks).not.toHaveBeenCalled()
   })
 
-  it('rule 3: grok-* takes the grok bridge branch', async () => {
+  it('rule 3: grok-* takes the grok bridge branch and does not strip reasoning blocks', async () => {
     const req = createRequest({ baseUrl: '/api', model: 'grok-4.5' })
     const res = createResponse()
 
@@ -149,6 +165,7 @@ describe('handleMessagesRequest vendor routing on the unified /api mount', () =>
 
     expect(handleAnthropicToResponses).toHaveBeenCalledWith(req, res, 'grok')
     expect(openaiRoutes.handleResponses).not.toHaveBeenCalled()
+    expect(stripBridgeReasoningBlocks).not.toHaveBeenCalled()
   })
 
   it('rule 4: claude-* takes neither bridge branch (falls to the native Claude permission check)', async () => {

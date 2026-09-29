@@ -445,6 +445,11 @@ const handleResponses = async (req, res) => {
       schedulerModel
     ))
 
+    // Anthropic 桥接：账户已选定，让转换器按实际账户决定可回放的 grok reasoning（账户隔离）
+    if (typeof req._bridgeAccountSelected === 'function') {
+      req._bridgeAccountSelected(accountType, accountId)
+    }
+
     // 如果是 OpenAI-Responses 账户，使用专门的中继服务处理
     if (accountType === 'openai-responses') {
       logger.info(`🔀 Using OpenAI-Responses relay service for account: ${account.name}`)
