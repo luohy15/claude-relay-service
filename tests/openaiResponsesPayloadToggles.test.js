@@ -108,6 +108,7 @@ jest.mock('../src/utils/requestDetailHelper', () => ({
 
 const unifiedOpenAIScheduler = require('../src/services/scheduler/unifiedOpenAIScheduler')
 const axios = require('axios')
+const logger = require('../src/utils/logger')
 const apiKeyService = require('../src/services/apiKeyService')
 const openaiAccountService = require('../src/services/account/openaiAccountService')
 const openaiResponsesAccountService = require('../src/services/account/openaiResponsesAccountService')
@@ -662,5 +663,159 @@ describe('openai responses payload toggles', () => {
     expect(req.body.model).toBe('o1-mini')
     expect(req.body.prompt_cache_key).toBe('compact-key')
     expect(req.body.instructions).toBe(openaiRoutes.CODEX_CLI_INSTRUCTIONS)
+  })
+
+  const DESKTOP_UA =
+    'Codex Desktop/0.154.0-alpha.6.2 (Mac OS 27.0.0; arm64) unknown (Codex Desktop; 26.908.70816)'
+
+  function useOpenAIAccount() {
+    unifiedOpenAIScheduler.selectAccountForApiKey.mockResolvedValue({
+      accountId: 'openai-1',
+      accountType: 'openai'
+    })
+    openaiAccountService.getAccount.mockResolvedValue({
+      id: 'openai-1',
+      name: 'OpenAI Account',
+      accessToken: 'encrypted-token',
+      accountId: 'chatgpt-account-1'
+    })
+    axios.post.mockResolvedValue({
+      status: 200,
+      data: { model: 'gpt-5.4', usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } },
+      headers: {}
+    })
+  }
+
+  test('A5 Codex Desktop keeps client instructions; a non-Codex UA is still adapted', async () => {
+    const desktop = createReq({
+      userAgent: DESKTOP_UA,
+      body: {
+        model: 'gpt-5.4',
+        instructions: 'desktop system prompt',
+        prompt_cache_retention: '24h',
+        temperature: 0.2,
+        prompt_cache_key: 'desk-1'
+      }
+    })
+    await openaiRoutes.handleResponses(desktop, createRes())
+    expect(desktop.body.instructions).toBe('desktop system prompt')
+    expect(desktop.body.prompt_cache_retention).toBe('24h')
+    expect(desktop.body.temperature).toBe(0.2)
+
+    const curl = createReq({
+      userAgent: 'curl/8.7.1',
+      body: {
+        model: 'gpt-5.4',
+        instructions: 'client prompt',
+        prompt_cache_retention: '24h',
+        prompt_cache_key: 'curl-1'
+      }
+    })
+    await openaiRoutes.handleResponses(curl, createRes())
+    expect(curl.body.instructions).toBe(openaiRoutes.CODEX_CLI_INSTRUCTIONS)
+    expect(curl.body.prompt_cache_retention).toBeUndefined()
+
+    const legacyDesktop = createReq({
+      path: '/v1/responses/compact',
+      userAgent: DESKTOP_UA,
+      body: {
+        model: 'gpt-5.4',
+        instructions: 'desktop compact prompt',
+        prompt_cache_retention: '24h',
+        prompt_cache_key: 'desk-compact'
+      }
+    })
+    await openaiRoutes.handleResponses(legacyDesktop, createRes())
+    expect(legacyDesktop.body.instructions).toBe('desktop compact prompt')
+    expect(legacyDesktop.body.prompt_cache_retention).toBe('24h')
+
+    const cli = createReq({
+      userAgent: 'codex_cli_rs/0.1.0',
+      body: {
+        model: 'gpt-5.4',
+        instructions: 'cli prompt',
+        prompt_cache_key: 'cli-1'
+      }
+    })
+    await openaiRoutes.handleResponses(cli, createRes())
+    expect(cli.body.instructions).toBe('cli prompt')
+  })
+
+  test('A6 native Codex routing headers are forwarded; bridge requests and client auth are not', async () => {
+    useOpenAIAccount()
+    const routing = {
+      conversation_id: 'SECRET_CONV_VALUE',
+      'x-codex-turn-state': 'SECRET_TURN_STATE',
+      'x-codex-routing-hint': 'SECRET_ROUTING_HINT',
+      'x-codex-window-id': 'SECRET_WINDOW_ID'
+    }
+    const native = createReq({
+      userAgent: DESKTOP_UA,
+      body: {
+        model: 'gpt-5.4',
+        instructions: 'desktop system prompt',
+        prompt_cache_key: 'desk-headers',
+        stream: false
+      }
+    })
+    Object.assign(native.headers, routing, { authorization: 'Bearer client-token' })
+
+    await openaiRoutes.handleResponses(native, createRes())
+
+    const nativeHeaders = axios.post.mock.calls[0][2].headers
+    expect(nativeHeaders).toMatchObject({
+      ...routing,
+      authorization: 'Bearer decrypted-token'
+    })
+    expect(nativeHeaders.authorization).not.toBe('Bearer client-token')
+
+    const diagnostic = logger.info.mock.calls
+      .map((call) => call.map((part) => String(part)).join(' '))
+      .find((line) => line.includes('Native responses request'))
+    expect(diagnostic).toContain('uaFamily=codex-desktop')
+    expect(diagnostic).toContain('promptCacheKey=true')
+    const loggedNames = diagnostic.split('headerNames=')[1].split(' ')[0].split(',')
+    expect(loggedNames).toEqual(
+      Object.keys(native.headers)
+        .map((name) => name.toLowerCase())
+        .sort()
+    )
+    expect(diagnostic).not.toContain('SECRET_CONV_VALUE')
+    expect(diagnostic).not.toContain('SECRET_TURN_STATE')
+    expect(diagnostic).not.toContain('SECRET_ROUTING_HINT')
+    expect(diagnostic).not.toContain('SECRET_WINDOW_ID')
+    expect(diagnostic).not.toContain('client-token')
+
+    axios.post.mockClear()
+    logger.info.mockClear()
+    const bridged = createReq({
+      userAgent: DESKTOP_UA,
+      fromUnifiedEndpoint: true,
+      skipCodexModelNormalization: true,
+      body: {
+        model: 'gpt-5.4',
+        instructions: 'bridge prompt',
+        prompt_cache_key: 'bridge-headers',
+        stream: false
+      }
+    })
+    Object.assign(bridged.headers, routing, { authorization: 'Bearer client-token' })
+
+    await openaiRoutes.handleResponses(bridged, createRes())
+
+    const bridgedHeaders = axios.post.mock.calls[0][2].headers
+    expect(bridgedHeaders.conversation_id).toBeUndefined()
+    expect(bridgedHeaders['x-codex-turn-state']).toBeUndefined()
+    expect(bridgedHeaders['x-codex-routing-hint']).toBeUndefined()
+    expect(bridgedHeaders['x-codex-window-id']).toBeUndefined()
+    expect(bridgedHeaders.authorization).toBe('Bearer decrypted-token')
+    expect(
+      logger.info.mock.calls.some((call) =>
+        call
+          .map((part) => String(part))
+          .join(' ')
+          .includes('Native responses request')
+      )
+    ).toBe(false)
   })
 })

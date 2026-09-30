@@ -31,7 +31,9 @@ const {
   convertResponseToAnthropic,
   buildErrorEnvelope,
   estimateInputTokens,
-  handleAnthropicToResponses
+  handleAnthropicToResponses,
+  encodeReasoningEnvelope,
+  accountFingerprint
 } = require('../src/services/anthropicToResponses')
 
 // 把 convertStreamEvent 输出的 SSE 字符串解析回 { event, data }，方便断言事件序列
@@ -1537,5 +1539,219 @@ describe('anthropicToResponses bridge entry', () => {
         message: "The 'grok-4.5' model is not supported"
       }
     })
+  })
+
+  test('grok bridge sets x-grok-conv-id to the resolved prompt_cache_key', async () => {
+    openaiRoutes.handleResponses.mockImplementation(async (req, res) => res.end())
+
+    const sameSession = JSON.stringify({ device_id: 'd', session_id: 'sess-same' })
+    const first = createFakeReq({
+      model: 'grok-4.7',
+      stream: true,
+      metadata: { user_id: sameSession },
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    const second = createFakeReq({
+      model: 'grok-4.7',
+      stream: true,
+      metadata: { user_id: sameSession },
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'hello' },
+        { role: 'user', content: 'again' }
+      ]
+    })
+    const other = createFakeReq({
+      model: 'grok-4.7',
+      stream: true,
+      metadata: { user_id: JSON.stringify({ device_id: 'd', session_id: 'sess-other' }) },
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    const overridden = createFakeReq({
+      model: 'grok-4.7',
+      stream: true,
+      metadata: { user_id: sameSession },
+      prompt_cache_key: 'client-cache-key',
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+
+    await handleAnthropicToResponses(first, createFakeRes().res, 'grok')
+    await handleAnthropicToResponses(second, createFakeRes().res, 'grok')
+    await handleAnthropicToResponses(other, createFakeRes().res, 'grok')
+    await handleAnthropicToResponses(overridden, createFakeRes().res, 'grok')
+
+    expect(first.headers['x-grok-conv-id']).toBe('sess-same')
+    expect(first.headers['x-grok-conv-id']).toBe(first.body.prompt_cache_key)
+    expect(second.headers['x-grok-conv-id']).toBe(first.headers['x-grok-conv-id'])
+    expect(other.headers['x-grok-conv-id']).toBe('sess-other')
+    expect(other.headers['x-grok-conv-id']).not.toBe(first.headers['x-grok-conv-id'])
+    expect(overridden.headers['x-grok-conv-id']).toBe('client-cache-key')
+    expect(overridden.body.prompt_cache_key).toBe('client-cache-key')
+  })
+
+  test('codex bridge requests do not carry x-grok-conv-id', async () => {
+    openaiRoutes.handleResponses.mockImplementation(async (req, res) => res.end())
+
+    const req = createFakeReq({
+      model: 'gpt-5.6-sol',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    await handleAnthropicToResponses(req, createFakeRes().res, 'codex')
+
+    expect(req.headers['x-grok-conv-id']).toBeUndefined()
+    expect(req.headers['x-grok-client-version']).toBeUndefined()
+  })
+})
+
+describe('grok reasoning replay retention (todo 3798)', () => {
+  const acct = accountFingerprint('acct-3798')
+  const otherAcct = accountFingerprint('acct-other')
+  const ENC_CAP = 512 * 1024
+
+  function messagesForRounds(count, enc) {
+    const messages = [{ role: 'user', content: 'do the task' }]
+    for (let i = 0; i < count; i += 1) {
+      messages.push({
+        role: 'assistant',
+        content: [
+          {
+            type: 'redacted_thinking',
+            data: encodeReasoningEnvelope({ acct, id: `rs_${i}`, enc })
+          },
+          { type: 'tool_use', id: `toolu_${i}`, name: 'bash', input: { i } }
+        ]
+      })
+      messages.push({
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: `toolu_${i}`, content: 'ok' }]
+      })
+    }
+    return messages
+  }
+
+  function grokInput(messages) {
+    return buildResponsesRequestFromAnthropic(
+      { model: 'grok-4.7', messages },
+      { vendor: 'grok', acctFp: acct }
+    ).input
+  }
+
+  function expectedStart(byteLengths) {
+    const prefix = [0]
+    for (const bytes of byteLengths) {
+      prefix.push(prefix[prefix.length - 1] + bytes)
+    }
+    const total = prefix[byteLengths.length]
+    let start = 0
+    while (start < byteLengths.length && total - prefix[start] > ENC_CAP) {
+      start += 16
+    }
+    return start
+  }
+
+  test('A1 growing current turn stays an append-only prefix through 60 envelopes', () => {
+    const enc = 'e'.repeat(1024)
+    const inputs = []
+    for (let n = 1; n <= 60; n += 1) {
+      inputs.push(grokInput(messagesForRounds(n, enc)))
+    }
+    for (let n = 1; n < 60; n += 1) {
+      const current = inputs[n - 1]
+      const next = inputs[n]
+      expect(next.slice(0, current.length)).toEqual(current)
+    }
+  })
+
+  test('A2 byte cap evicts oldest blocks of 16 and holds the boundary for at least 8 rounds', () => {
+    const enc = 'b'.repeat(40 * 1024)
+    const byteLengths = []
+    const starts = []
+    for (let n = 1; n <= 40; n += 1) {
+      byteLengths.push(Buffer.byteLength(enc, 'utf8'))
+      const input = grokInput(messagesForRounds(n, enc))
+      const ids = input.filter((item) => item.type === 'reasoning').map((item) => item.id)
+      const replayedBytes = input
+        .filter((item) => item.type === 'reasoning')
+        .reduce((sum, item) => sum + Buffer.byteLength(item.encrypted_content, 'utf8'), 0)
+      const start = expectedStart(byteLengths)
+      expect(start % 16).toBe(0)
+      expect(replayedBytes).toBeLessThanOrEqual(ENC_CAP)
+      const expectedIds =
+        start >= n ? [] : Array.from({ length: n - start }, (_, offset) => `rs_${start + offset}`)
+      expect(ids).toEqual(expectedIds)
+      starts.push(start)
+    }
+
+    let streak = 1
+    let best = 1
+    for (let n = 1; n < starts.length; n += 1) {
+      if (starts[n] === starts[n - 1]) {
+        streak += 1
+        best = Math.max(best, streak)
+        continue
+      }
+      const oldStart = starts[n - 1]
+      let suffix = 0
+      for (let i = oldStart; i <= n; i += 1) {
+        suffix += byteLengths[i]
+      }
+      expect(suffix).toBeGreaterThan(ENC_CAP)
+      streak = 1
+    }
+    expect(best).toBeGreaterThanOrEqual(8)
+  })
+
+  test('A3 prior-turn, other-account and invalid envelopes are dropped, and a retry is byte-identical', () => {
+    const enc = 'e'.repeat(128)
+    const kept = encodeReasoningEnvelope({ acct, id: 'rs_kept', enc })
+    const prior = encodeReasoningEnvelope({ acct, id: 'rs_prior', enc })
+    const foreign = encodeReasoningEnvelope({ acct: otherAcct, id: 'rs_foreign', enc })
+    const tampered = `${encodeReasoningEnvelope({ acct, id: 'rs_bad', enc }).slice(0, -1)}x`
+
+    const messages = [
+      { role: 'user', content: 'old task' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'redacted_thinking', data: prior },
+          { type: 'text', text: 'done' }
+        ]
+      },
+      { role: 'user', content: 'new task' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'redacted_thinking', data: kept },
+          { type: 'redacted_thinking', data: foreign },
+          { type: 'redacted_thinking', data: tampered },
+          { type: 'tool_use', id: 'toolu_kept', name: 'bash', input: { cmd: 'pwd' } }
+        ]
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_kept', content: 'ok' }]
+      }
+    ]
+
+    const first = buildResponsesRequestFromAnthropic(
+      { model: 'grok-4.7', messages },
+      { vendor: 'grok', acctFp: acct }
+    )
+    const retry = buildResponsesRequestFromAnthropic(
+      { model: 'grok-4.7', messages },
+      { vendor: 'grok', acctFp: acct }
+    )
+    const codex = buildResponsesRequestFromAnthropic(
+      { model: 'gpt-5.6-sol', messages },
+      { vendor: 'codex', acctFp: acct }
+    )
+
+    const reasoning = first.input.filter((item) => item.type === 'reasoning')
+    expect(reasoning).toEqual([
+      { type: 'reasoning', id: 'rs_kept', summary: [], encrypted_content: enc }
+    ])
+    expect(JSON.stringify(retry)).toBe(JSON.stringify(first))
+    expect(codex.input.some((item) => item.type === 'reasoning')).toBe(false)
   })
 })

@@ -364,11 +364,28 @@ const handleResponses = async (req, res) => {
       })
     }
 
-    // 判断是否为 Codex CLI 的请求（基于 User-Agent）
-    // 支持: codex_vscode, codex_cli_rs, codex_exec (非交互式/脚本模式)
+    // 判断是否为原生 Codex 客户端（基于 User-Agent）
+    // 支持: codex_vscode, codex_cli_rs, codex_exec (非交互式/脚本模式), Codex Desktop
     const userAgent = req.headers['user-agent'] || ''
-    const codexCliPattern = /^(codex_vscode|codex_cli_rs|codex_exec)\/[\d.]+/i
+    const codexCliPattern = /^(?:(?:codex_vscode|codex_cli_rs|codex_exec)\/[\d.]+|Codex Desktop\/)/i
     const isCodexCLI = codexCliPattern.test(userAgent)
+
+    // 原生 /openai/responses：只记 UA 家族、header 名和 prompt_cache_key 是否存在，不记值
+    if (!req._fromUnifiedEndpoint && (req.path === '/responses' || req.path === '/v1/responses')) {
+      const uaFamily = /^Codex Desktop\//i.test(userAgent)
+        ? 'codex-desktop'
+        : /^(?:codex_vscode|codex_cli_rs|codex_exec)\//i.test(userAgent)
+          ? 'codex-cli'
+          : 'other'
+      const headerNames = Object.keys(req.headers || {})
+        .map((name) => name.toLowerCase())
+        .sort()
+      const hasPromptCacheKey =
+        !!req.body && Object.prototype.hasOwnProperty.call(req.body, 'prompt_cache_key')
+      logger.info(
+        `🧭 Native responses request: uaFamily=${uaFamily} headerNames=${headerNames.join(',')} promptCacheKey=${hasPromptCacheKey}`
+      )
+    }
 
     const standardResponsesRoute = isStandardResponsesRoute(req)
     const compactRoute = isCompactResponsesRoute(req)
@@ -475,6 +492,15 @@ const handleResponses = async (req, res) => {
     const incoming = req.headers || {}
 
     const allowedKeys = ['version', 'openai-beta', 'session_id']
+    // 只放行原生 Codex 客户端的路由头。桥接（_fromUnifiedEndpoint）不带这些头
+    if (isCodexCLI && !req._fromUnifiedEndpoint) {
+      allowedKeys.push(
+        'conversation_id',
+        'x-codex-turn-state',
+        'x-codex-routing-hint',
+        'x-codex-window-id'
+      )
+    }
 
     const headers = {}
     for (const key of allowedKeys) {

@@ -69,7 +69,8 @@ const REASONING_MAX_ID_CHARS = 256
 const REASONING_MAX_ENC_BYTES = 512 * 1024
 // 解码前的整体长度闸：base64 膨胀 4/3 后再留余量，超长直接丢，不做 base64/JSON 解析
 const REASONING_MAX_ENVELOPE_CHARS = Math.ceil(((REASONING_MAX_ENC_BYTES + 4096) * 4) / 3) + 64
-const REASONING_REPLAY_MAX_ITEMS = 16
+// 字节上限溢出时一次丢掉的最旧条目数。按块而不是逐条丢，回放起点才不会每轮移动
+const REASONING_REPLAY_EVICT_BLOCK = 16
 
 function reasoningHmac(label, value) {
   // lazy require：只有 grok reasoning 路径需要密钥
@@ -201,8 +202,9 @@ function isUserTurnBoundary(message) {
 }
 
 /**
- * 选出本轮可回放的 reasoning：只看当前 agentic 轮、只认本账户指纹、最新 16 条、
- * encrypted_content 合计不超过 512 KB（超出时从最旧的开始丢）
+ * 选出本轮可回放的 reasoning：只看当前 agentic 轮、只认本账户指纹、
+ * encrypted_content 合计不超过 512 KB。超出时按 16 条一块从最旧端丢弃，
+ * 回放起点是后缀仍能放进上限的最小 16 倍数（边界每至少 16 轮才移动一次）
  * @returns {{items: Map<Object, Object>, stats: Object}} items: 源 block → Responses reasoning item
  */
 function selectReplayReasoning(messages, acctFp) {
@@ -243,15 +245,23 @@ function selectReplayReasoning(messages, acctFp) {
     }
   })
 
-  let totalBytes = 0
-  for (let i = candidates.length - 1; i >= 0; i -= 1) {
-    const { block, envelope } = candidates[i]
-    const bytes = Buffer.byteLength(envelope.enc, 'utf8')
-    if (items.size >= REASONING_REPLAY_MAX_ITEMS || totalBytes + bytes > REASONING_MAX_ENC_BYTES) {
-      stats.overCap = i + 1
+  const encBytes = candidates.map((candidate) => Buffer.byteLength(candidate.envelope.enc, 'utf8'))
+  let start = 0
+  while (start < candidates.length) {
+    let suffixBytes = 0
+    for (let i = start; i < candidates.length; i += 1) {
+      suffixBytes += encBytes[i]
+    }
+    if (suffixBytes <= REASONING_MAX_ENC_BYTES) {
       break
     }
-    totalBytes += bytes
+    start += REASONING_REPLAY_EVICT_BLOCK
+  }
+  if (start > 0) {
+    stats.overCap = Math.min(start, candidates.length)
+  }
+  for (let i = start; i < candidates.length; i += 1) {
+    const { block, envelope } = candidates[i]
     items.set(block, {
       type: 'reasoning',
       id: envelope.id,
@@ -1074,7 +1084,7 @@ function estimateInputTokens(anthropicBody) {
 // 桥接入口: /codex/api、/grok/api 的 /v1/messages
 // =============================================
 
-function applyGrokHeaders(req, model) {
+function applyGrokHeaders(req, model, convId) {
   // grok-build 客户端自带的指纹头部，Claude Code 不会带；X-XAI-Token-Auth 由 relay 侧注入。
   // lazy require：转换逻辑本身不需要账户服务，避免为它拉起 redis 依赖
   const {
@@ -1085,6 +1095,10 @@ function applyGrokHeaders(req, model) {
   req.headers['x-grok-client-identifier'] = GROK_CLI_CLIENT_IDENTIFIER
   if (model) {
     req.headers['x-grok-model-override'] = model
+  }
+  // 与 body.prompt_cache_key 用同一个稳定会话 id。cli-chat-proxy 可能按这个头做缓存路由
+  if (convId) {
+    req.headers['x-grok-conv-id'] = convId
   }
 }
 
@@ -1558,8 +1572,13 @@ async function handleAnthropicToResponses(req, res, vendor) {
   // isStream 仍表示*客户端*意图，日志与响应形态都用它区分，方便对照上游。
   req.headers['accept'] = 'text/event-stream'
 
+  // prompt_cache_key 只在源请求体（客户端的 Anthropic Messages body）里没有这个字段时
+  // 才写入——协议目前没有这个字段，这里只是让优先级显式：不覆盖任何客户端自带值。
+  const clientPromptCacheKey = anthropicBody.prompt_cache_key
+  const promptCacheKey = clientPromptCacheKey || sessionHash
+
   if (vendor === 'grok') {
-    applyGrokHeaders(req, upstreamModel)
+    applyGrokHeaders(req, upstreamModel, promptCacheKey)
   }
 
   // grok reasoning 回放 / 下发都绑定到实际选中的账户：账户在 openaiRoutes.handleResponses
@@ -1567,9 +1586,6 @@ async function handleAnthropicToResponses(req, res, vendor) {
   const reasoning = vendor === 'grok' ? { vendor, acctFp: null } : null
   patchResponseForAnthropic(req, res, { model: requestedModel, stream: isStream, reasoning })
 
-  // prompt_cache_key 只在源请求体（客户端的 Anthropic Messages body）里没有这个字段时
-  // 才写入——协议目前没有这个字段，这里只是让优先级显式：不覆盖任何客户端自带值。
-  const clientPromptCacheKey = anthropicBody.prompt_cache_key
   req.body = buildResponsesRequestFromAnthropic(anthropicBody, { vendor })
 
   if (reasoning) {
@@ -1587,7 +1603,7 @@ async function handleAnthropicToResponses(req, res, vendor) {
       }
     }
   }
-  req.body.prompt_cache_key = clientPromptCacheKey || sessionHash
+  req.body.prompt_cache_key = promptCacheKey
   req.body.stream = true
   // 载荷已是 Responses 格式，路径必须与之匹配（req.path 是只读 getter，派生自 req.url）
   req.url = '/v1/responses'
