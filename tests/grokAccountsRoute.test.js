@@ -259,7 +259,7 @@ describe('admin grok accounts route - connectivity test endpoint', () => {
       'Content-Type': 'application/json',
       Authorization: 'Bearer plaintext-access-token',
       'X-XAI-Token-Auth': 'xai-grok-cli',
-      'x-grok-client-version': '0.2.101',
+      'x-grok-client-version': '1.0.46',
       'x-grok-client-identifier': 'grok-shell',
       'x-grok-model-override': 'grok-4.5'
     })

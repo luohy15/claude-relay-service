@@ -1027,7 +1027,7 @@ describe('anthropicToResponses bridge entry', () => {
 
     await handleAnthropicToResponses(req, res, 'grok')
 
-    expect(req.headers['x-grok-client-version']).toBe('0.2.101')
+    expect(req.headers['x-grok-client-version']).toBe('1.0.46')
     expect(req.headers['x-grok-client-identifier']).toBe('grok-shell')
     expect(req.headers['x-grok-model-override']).toBe('grok-4.5')
     // grok arm gets prompt_cache_key too, not just codex

@@ -818,4 +818,50 @@ describe('openai responses payload toggles', () => {
       )
     ).toBe(false)
   })
+
+  test('A10 native Codex hyphenated routing headers are forwarded; bridge requests drop them', async () => {
+    useOpenAIAccount()
+    const routing = {
+      session_id: 'sess-underscore',
+      'session-id': 'sess-hyphen',
+      'thread-id': 'thread-1',
+      'x-codex-turn-metadata': '{"turn":1}'
+    }
+    const native = createReq({
+      userAgent: DESKTOP_UA,
+      body: { model: 'gpt-5.4', prompt_cache_key: 'desk-hyphen', stream: false }
+    })
+    Object.assign(native.headers, routing, {
+      authorization: 'Bearer client-token',
+      host: 'evil.example',
+      'chatgpt-account-id': 'client-account'
+    })
+
+    await openaiRoutes.handleResponses(native, createRes())
+
+    const nativeHeaders = axios.post.mock.calls[0][2].headers
+    expect(nativeHeaders).toMatchObject({
+      ...routing,
+      authorization: 'Bearer decrypted-token',
+      host: 'chatgpt.com'
+    })
+    expect(nativeHeaders['chatgpt-account-id']).not.toBe('client-account')
+
+    axios.post.mockClear()
+    const bridged = createReq({
+      userAgent: DESKTOP_UA,
+      fromUnifiedEndpoint: true,
+      skipCodexModelNormalization: true,
+      body: { model: 'gpt-5.4', prompt_cache_key: 'bridge-hyphen', stream: false }
+    })
+    Object.assign(bridged.headers, routing)
+
+    await openaiRoutes.handleResponses(bridged, createRes())
+
+    const bridgedHeaders = axios.post.mock.calls[0][2].headers
+    expect(bridgedHeaders.session_id).toBe('sess-underscore')
+    expect(bridgedHeaders['session-id']).toBeUndefined()
+    expect(bridgedHeaders['thread-id']).toBeUndefined()
+    expect(bridgedHeaders['x-codex-turn-metadata']).toBeUndefined()
+  })
 })

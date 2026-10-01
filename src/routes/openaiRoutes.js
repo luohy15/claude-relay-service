@@ -498,7 +498,10 @@ const handleResponses = async (req, res) => {
         'conversation_id',
         'x-codex-turn-state',
         'x-codex-routing-hint',
-        'x-codex-window-id'
+        'x-codex-window-id',
+        'session-id',
+        'thread-id',
+        'x-codex-turn-metadata'
       )
     }
 
