@@ -2695,6 +2695,7 @@ class ClaudeRelayService {
           })
         }
 
+        dataSource.setEncoding('utf8')
         dataSource.on('data', (chunk) => {
           try {
             const chunkStr = chunk.toString()

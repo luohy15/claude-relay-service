@@ -782,6 +782,7 @@ class CcrRelayService {
           let rawBuffer = ''
           const collectedUsage = {}
 
+          response.data.setEncoding('utf8')
           response.data.on('data', (chunk) => {
             if (aborted || responseStream.destroyed) {
               return

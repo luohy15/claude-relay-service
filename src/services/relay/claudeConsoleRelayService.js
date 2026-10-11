@@ -1020,6 +1020,7 @@ class ClaudeConsoleRelayService {
           }
 
           // 处理流数据
+          response.data.setEncoding('utf8')
           response.data.on('data', (chunk) => {
             try {
               if (aborted) {
