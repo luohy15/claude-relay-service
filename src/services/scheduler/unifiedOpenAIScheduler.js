@@ -188,12 +188,17 @@ class UnifiedOpenAIScheduler {
             boundAccount.id,
             accountType
           )
+          let fallbackToPool = false
           if (isTempUnavailable) {
+            const poolAccounts = await this._getAllAvailableAccounts(apiKeyData, requestedModel)
+            fallbackToPool = poolAccounts.length > 0
             logger.warn(
-              `⏱️ Bound ${accountType} account ${boundAccount.name} temporarily unavailable, falling back to pool`
+              fallbackToPool
+                ? `⏱️ Bound ${accountType} account ${boundAccount.name} temporarily unavailable, falling back to pool`
+                : `⏱️ Bound ${accountType} account ${boundAccount.name}: no pool alternative, using bound account despite cooldown`
             )
-            // 不 throw，让代码继续走到共享池选择
-          } else {
+          }
+          if (!fallbackToPool) {
             if (accountType === 'openai' || accountType === 'grok') {
               const readiness = await this._ensureAccountReadyForScheduling(
                 boundAccount,
