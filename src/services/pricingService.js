@@ -17,8 +17,15 @@ class PricingService {
       'model-pricing',
       'model_prices_and_context_window.json'
     )
+    this.localOverridesFile = path.join(
+      process.cwd(),
+      'resources',
+      'model-pricing',
+      'local_overrides.json'
+    )
     this.localHashFile = path.join(this.dataDir, 'model_pricing.sha256')
     this.pricingData = null
+    this.localOverrides = {}
     this.lastUpdated = null
     this.updateInterval = 24 * 60 * 60 * 1000 // 24小时
     this.hashCheckInterval = 10 * 60 * 1000 // 10分钟哈希校验
@@ -40,6 +47,31 @@ class PricingService {
       context1mBeta: 'context-1m-2025-08-07',
       fastModeBeta: 'fast-mode-2026-02-01',
       fastModeSpeed: 'fast'
+    }
+
+    this.loadLocalOverrides()
+  }
+
+  // 本地精确覆盖。缺失或无效时为空对象，不阻断启动。
+  loadLocalOverrides() {
+    try {
+      if (!fs.existsSync(this.localOverridesFile)) {
+        this.localOverrides = {}
+        logger.warn(`⚠️  Local pricing overrides file not found: ${this.localOverridesFile}`)
+        return
+      }
+
+      const parsed = JSON.parse(fs.readFileSync(this.localOverridesFile, 'utf8'))
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        this.localOverrides = {}
+        logger.warn('⚠️  Local pricing overrides file is invalid, using empty overrides')
+        return
+      }
+
+      this.localOverrides = parsed
+    } catch (error) {
+      this.localOverrides = {}
+      logger.warn(`⚠️  Failed to load local pricing overrides: ${error.message}`)
     }
   }
 
@@ -353,7 +385,17 @@ class PricingService {
 
   // 获取模型价格信息
   getModelPricing(modelName) {
-    if (!this.pricingData || !modelName) {
+    if (!modelName) {
+      return null
+    }
+
+    // 精确覆盖优先于远端目录，也优先于 pricingData 为空时的直接返回
+    if (this.localOverrides && this.localOverrides[modelName]) {
+      logger.debug(`💰 Found local override pricing for ${modelName}`)
+      return this.localOverrides[modelName]
+    }
+
+    if (!this.pricingData) {
       return null
     }
 
