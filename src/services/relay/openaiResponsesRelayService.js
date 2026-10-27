@@ -942,12 +942,24 @@ class OpenAIResponsesRelayService {
           )
         }
       }
-
-      if (!resetsInSeconds) {
-        logger.warn('⚠️ Could not extract reset time from 429 response, using default 60 minutes')
-      }
     } catch (e) {
       logger.error('⚠️ Failed to parse rate limit error:', e)
+    }
+
+    // OpenRouter 等上游不带 OpenAI 的 resets_in_seconds，重置时间在响应头里。
+    // 没有这段回退时，调度器会把一次约 30 秒的 429 记成 60 分钟。
+    if (!resetsInSeconds) {
+      const headerSeconds = upstreamErrorHelper.parseRetryAfter(response && response.headers)
+      if (headerSeconds) {
+        resetsInSeconds = headerSeconds
+        logger.info(
+          `🕐 Rate limit will reset in ${resetsInSeconds} seconds (from response headers) (${Math.ceil(resetsInSeconds / 60)} minutes / ${Math.ceil(resetsInSeconds / 3600)} hours)`
+        )
+      }
+    }
+
+    if (!resetsInSeconds) {
+      logger.warn('⚠️ Could not extract reset time from 429 response, using default 60 minutes')
     }
 
     // 使用统一调度器标记账户为限流状态（与普通OpenAI账号保持一致）
