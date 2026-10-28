@@ -814,7 +814,7 @@ const handleResponses = async (req, res) => {
           )
 
           logger.info(
-            `📊 Recorded OpenAI non-stream usage - Input: ${totalInputTokens}(actual:${actualInputTokens}+cached:${cacheReadTokens}), Output: ${outputTokens}, Total: ${usageData.total_tokens || totalInputTokens + outputTokens}, Model: ${actualModel}`
+            `📊 Recorded OpenAI non-stream usage - Input: ${totalInputTokens}(actual:${actualInputTokens}+cached:${cacheReadTokens}), Output: ${outputTokens}, Reasoning: ${usageData.output_tokens_details?.reasoning_tokens ?? 'n/a'}, Total: ${usageData.total_tokens || totalInputTokens + outputTokens}, Model: ${actualModel}`
           )
 
           await applyRateLimitTracking(
@@ -937,7 +937,7 @@ const handleResponses = async (req, res) => {
           )
 
           logger.info(
-            `📊 Recorded OpenAI usage - Input: ${totalInputTokens}(actual:${actualInputTokens}+cached:${cacheReadTokens}), Output: ${outputTokens}, Total: ${usageData.total_tokens || totalInputTokens + outputTokens}, Model: ${modelToRecord} (actual: ${actualModel}, requested: ${upstreamRequestedModel})`
+            `📊 Recorded OpenAI usage - Input: ${totalInputTokens}(actual:${actualInputTokens}+cached:${cacheReadTokens}), Output: ${outputTokens}, Reasoning: ${usageData.output_tokens_details?.reasoning_tokens ?? 'n/a'}, Total: ${usageData.total_tokens || totalInputTokens + outputTokens}, Model: ${modelToRecord} (actual: ${actualModel}, requested: ${upstreamRequestedModel})`
           )
           usageReported = true
 

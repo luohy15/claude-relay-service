@@ -462,8 +462,22 @@ function convertToolChoice(toolChoice) {
   }
 }
 
-// Anthropic 的 thinking.budget_tokens → Responses 的 reasoning.effort（无精确对应，按档位近似）
+// Claude Code 把 --effort 放在 output_config.effort（thinking 同时是 {type:'adaptive'}），
+// 所以优先读它；Anthropic 的 thinking.budget_tokens → reasoning.effort 仍按档位近似兜底。
+// max / xhigh → xhigh：只对实测过的模型确认过接受（gpt-6-astra 见 todo 4062 S0，
+// grok-4.7 见 todo 3733 直连 A/B）；sol / terra 未单独实测，若拒绝则 --effort max
+// 返回 400，默认的 high 不受影响。
 function mapReasoningEffort(body) {
+  const requested = body?.output_config?.effort
+  if (typeof requested === 'string' && requested) {
+    const normalized = requested.toLowerCase()
+    if (normalized === 'max' || normalized === 'xhigh') {
+      return 'xhigh'
+    }
+    if (normalized === 'low' || normalized === 'medium' || normalized === 'high') {
+      return normalized
+    }
+  }
   const thinking = body?.thinking
   if (thinking && thinking.type === 'enabled') {
     const budget = Number(thinking.budget_tokens)
@@ -480,6 +494,10 @@ function mapReasoningEffort(body) {
   }
   if (thinking && thinking.type === 'disabled') {
     return 'low'
+  }
+  // {type:'adaptive'} 表示客户端让模型自行决定思考量，默认按 high 处理（todo 4062）
+  if (thinking && thinking.type === 'adaptive') {
+    return 'high'
   }
   return 'medium'
 }
