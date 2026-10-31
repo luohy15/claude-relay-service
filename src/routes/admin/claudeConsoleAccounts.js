@@ -15,6 +15,7 @@ const { authenticateAdmin } = require('../../middleware/auth')
 const logger = require('../../utils/logger')
 const webhookNotifier = require('../../utils/webhookNotifier')
 const { formatAccountExpiry, mapExpiryField } = require('./utils')
+const deepseekProvider = require('../../services/deepseekProvider')
 
 // 获取所有Claude Console账户
 router.get('/claude-console-accounts', authenticateAdmin, async (req, res) => {
@@ -133,10 +134,22 @@ router.post('/claude-console-accounts', authenticateAdmin, async (req, res) => {
       quotaResetTime,
       maxConcurrentTasks,
       disableAutoProtection,
-      interceptWarmup
+      interceptWarmup,
+      provider
     } = req.body
 
-    if (!name || !apiUrl || !apiKey) {
+    let providerConfig
+    try {
+      providerConfig = deepseekProvider.normalizeAccountConfig({
+        provider,
+        apiUrl,
+        supportedModels
+      })
+    } catch (error) {
+      return res.status(400).json({ error: error.message })
+    }
+
+    if (!name || !apiKey || (!apiUrl && providerConfig.provider !== 'deepseek')) {
       return res.status(400).json({ error: 'Name, API URL and API Key are required' })
     }
 
@@ -172,10 +185,14 @@ router.post('/claude-console-accounts', authenticateAdmin, async (req, res) => {
     const newAccount = await claudeConsoleAccountService.createAccount({
       name,
       description,
-      apiUrl,
+      apiUrl: providerConfig.provider === 'deepseek' ? providerConfig.apiUrl : apiUrl,
       apiKey,
       priority: priority || 50,
-      supportedModels: supportedModels || [],
+      supportedModels:
+        providerConfig.provider === 'deepseek'
+          ? providerConfig.supportedModels
+          : supportedModels || [],
+      provider: providerConfig.provider,
       userAgent,
       rateLimitDuration:
         rateLimitDuration !== undefined && rateLimitDuration !== null ? rateLimitDuration : 60,
@@ -200,7 +217,10 @@ router.post('/claude-console-accounts', authenticateAdmin, async (req, res) => {
     const formattedAccount = formatAccountExpiry(newAccount)
     return res.json({ success: true, data: formattedAccount })
   } catch (error) {
-    logger.error('❌ Failed to create Claude Console account:', error)
+    logger.error('❌ Failed to create Claude Console account:', error.message)
+    if (error.statusCode === 400) {
+      return res.status(400).json({ error: error.message })
+    }
     return res
       .status(500)
       .json({ error: 'Failed to create Claude Console account', message: error.message })
@@ -295,9 +315,20 @@ router.put('/claude-console-accounts/:accountId', authenticateAdmin, async (req,
     await claudeConsoleAccountService.updateAccount(accountId, mappedUpdates)
 
     logger.success(`📝 Admin updated Claude Console account: ${accountId}`)
-    return res.json({ success: true, message: 'Claude Console account updated successfully' })
+    const updated = await claudeConsoleAccountService.getAccount(accountId)
+    if (updated) {
+      delete updated.apiKey
+    }
+    return res.json({
+      success: true,
+      message: 'Claude Console account updated successfully',
+      data: formatAccountExpiry(updated)
+    })
   } catch (error) {
-    logger.error('❌ Failed to update Claude Console account:', error)
+    logger.error('❌ Failed to update Claude Console account:', error.message)
+    if (error.statusCode === 400) {
+      return res.status(400).json({ error: error.message })
+    }
     return res
       .status(500)
       .json({ error: 'Failed to update Claude Console account', message: error.message })

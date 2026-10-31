@@ -1306,6 +1306,23 @@
               v-if="(form.platform === 'claude-console' || form.platform === 'ccr') && !isEdit"
               class="space-y-4"
             >
+              <div v-if="form.platform === 'claude-console'">
+                <label class="mb-3 block text-sm font-semibold text-gray-700 dark:text-gray-300"
+                  >上游预设</label
+                >
+                <select
+                  v-model="form.consoleProvider"
+                  class="form-input w-full border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200"
+                  @change="onConsoleProviderChange"
+                >
+                  <option value="">Claude Console</option>
+                  <option value="deepseek">DeepSeek</option>
+                </select>
+                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                  DeepSeek 默认 https://api.deepseek.com/anthropic，模型 deepseek-flash 与
+                  deepseek-v4-pro。已填写的 URL 和模型不会被覆盖。
+                </p>
+              </div>
               <div>
                 <label class="mb-3 block text-sm font-semibold text-gray-700 dark:text-gray-300"
                   >API URL *</label
@@ -3109,6 +3126,23 @@
             v-if="form.platform === 'claude-console' || form.platform === 'ccr'"
             class="space-y-4"
           >
+            <div v-if="form.platform === 'claude-console'">
+              <label class="mb-3 block text-sm font-semibold text-gray-700 dark:text-gray-300"
+                >上游预设</label
+              >
+              <select
+                v-model="form.consoleProvider"
+                class="form-input w-full border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200"
+                @change="onConsoleProviderChange"
+              >
+                <option value="">Claude Console</option>
+                <option value="deepseek">DeepSeek</option>
+              </select>
+              <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                DeepSeek 默认 https://api.deepseek.com/anthropic，模型 deepseek-flash 与
+                deepseek-v4-pro。已填写的 URL 和模型不会被覆盖。
+              </p>
+            </div>
             <div>
               <label class="mb-3 block text-sm font-semibold text-gray-700">API URL</label>
               <input
@@ -4452,6 +4486,7 @@ const form = ref({
   proxy: initProxyConfig(),
   // Claude Console 特定字段
   apiUrl: props.account?.apiUrl || '',
+  consoleProvider: props.account?.provider === 'deepseek' ? 'deepseek' : '',
   apiKey: props.account?.apiKey || '',
   priority: props.account?.priority || 50,
   endpointType: props.account?.endpointType || 'anthropic',
@@ -5628,6 +5663,9 @@ const createAccount = async () => {
       data.priority = form.value.priority || 50
       data.supportedModels = convertMappingsToObject() || {}
       data.userAgent = form.value.userAgent || null
+      if (form.value.platform === 'claude-console') {
+        data.provider = form.value.consoleProvider === 'deepseek' ? 'deepseek' : ''
+      }
       // 如果不启用限流，传递 0 表示不限流
       data.rateLimitDuration = form.value.enableRateLimit ? form.value.rateLimitDuration || 60 : 0
       if (form.value.platform === 'claude-console') {
@@ -5989,6 +6027,7 @@ const updateAccount = async () => {
     // Claude Console 特定更新
     if (props.account.platform === 'claude-console') {
       data.apiUrl = form.value.apiUrl
+      data.provider = form.value.consoleProvider === 'deepseek' ? 'deepseek' : ''
       if (form.value.apiKey) {
         data.apiKey = form.value.apiKey
       }
@@ -6533,6 +6572,26 @@ const addPresetMapping = (from, to) => {
 }
 
 // 将模型映射表转换为对象格式（根据当前模式）
+const DEEPSEEK_API_URL = 'https://api.deepseek.com/anthropic'
+const DEEPSEEK_MODELS = ['deepseek-flash', 'deepseek-v4-pro']
+
+const onConsoleProviderChange = () => {
+  if (form.value.platform !== 'claude-console' || form.value.consoleProvider !== 'deepseek') {
+    return
+  }
+  if (!form.value.apiUrl || !form.value.apiUrl.trim()) {
+    form.value.apiUrl = DEEPSEEK_API_URL
+  }
+  const hasModels =
+    (Array.isArray(allowedModels.value) && allowedModels.value.length > 0) ||
+    (Array.isArray(modelMappings.value) &&
+      modelMappings.value.some((item) => item && item.from && item.to))
+  if (!hasModels) {
+    modelRestrictionMode.value = 'whitelist'
+    allowedModels.value = [...DEEPSEEK_MODELS]
+  }
+}
+
 const convertMappingsToObject = () => {
   const mapping = {}
 
@@ -6622,6 +6681,7 @@ watch(
         proxy: proxyConfig,
         // Claude Console 特定字段
         apiUrl: newAccount.apiUrl || '',
+        consoleProvider: newAccount.provider === 'deepseek' ? 'deepseek' : '',
         apiKey: '', // 编辑模式不显示现有的 API Key
         priority: newAccount.priority || 50,
         supportedModels: (() => {

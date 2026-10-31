@@ -6,6 +6,7 @@ const logger = require('../../utils/logger')
 const config = require('../../../config/config')
 const LRUCache = require('../../utils/lruCache')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const deepseekProvider = require('../deepseekProvider')
 
 class ClaudeConsoleAccountService {
   constructor() {
@@ -25,7 +26,7 @@ class ClaudeConsoleAccountService {
     this._decryptCache = new LRUCache(500)
 
     // 🧹 定期清理缓存（每10分钟）
-    setInterval(
+    this._decryptCacheTimer = setInterval(
       () => {
         this._decryptCache.cleanup()
         logger.info(
@@ -35,6 +36,20 @@ class ClaudeConsoleAccountService {
       },
       10 * 60 * 1000
     )
+    if (this._decryptCacheTimer.unref) {
+      this._decryptCacheTimer.unref()
+    }
+  }
+
+  _redactAccountSecrets(value) {
+    if (!value || typeof value !== 'object') {
+      return value
+    }
+    const copy = { ...value }
+    if (copy.apiKey) {
+      copy.apiKey = '[redacted]'
+    }
+    return copy
   }
 
   _getBlockedHandlingMinutes() {
@@ -70,25 +85,37 @@ class ClaudeConsoleAccountService {
       quotaResetTime = '00:00', // 额度重置时间（HH:mm格式）
       maxConcurrentTasks = 0, // 最大并发任务数，0表示无限制
       disableAutoProtection = false, // 是否关闭自动防护（429/401/400/529 不自动禁用）
-      interceptWarmup = false // 拦截预热请求（标题生成、Warmup等）
+      interceptWarmup = false, // 拦截预热请求（标题生成、Warmup等）
+      provider = ''
     } = options
 
+    const providerConfig = deepseekProvider.normalizeAccountConfig({
+      provider,
+      apiUrl,
+      supportedModels
+    })
+    const resolvedProvider = providerConfig.provider
+    const resolvedApiUrl = resolvedProvider === 'deepseek' ? providerConfig.apiUrl : apiUrl
+    const resolvedModels =
+      resolvedProvider === 'deepseek' ? providerConfig.supportedModels : supportedModels
+
     // 验证必填字段
-    if (!apiUrl || !apiKey) {
+    if (!resolvedApiUrl || !apiKey) {
       throw new Error('API URL and API Key are required for Claude Console account')
     }
 
     const accountId = uuidv4()
 
     // 处理 supportedModels，确保向后兼容
-    const processedModels = this._processModelMapping(supportedModels)
+    const processedModels = this._processModelMapping(resolvedModels)
 
     const accountData = {
       id: accountId,
       platform: 'claude-console',
+      provider: resolvedProvider,
       name,
       description,
-      apiUrl,
+      apiUrl: resolvedApiUrl,
       apiKey: this._encryptSensitiveData(apiKey),
       priority: priority.toString(),
       supportedModels: JSON.stringify(processedModels),
@@ -127,7 +154,9 @@ class ClaudeConsoleAccountService {
     logger.debug(
       `[DEBUG] Saving account data to Redis with key: ${this.ACCOUNT_KEY_PREFIX}${accountId}`
     )
-    logger.debug(`[DEBUG] Account data to save: ${JSON.stringify(accountData, null, 2)}`)
+    logger.debug(
+      `[DEBUG] Account data to save: ${JSON.stringify(this._redactAccountSecrets(accountData), null, 2)}`
+    )
 
     await client.hset(`${this.ACCOUNT_KEY_PREFIX}${accountId}`, accountData)
     await redis.addToIndex('claude_console_account:index', accountId)
@@ -141,11 +170,12 @@ class ClaudeConsoleAccountService {
 
     return {
       id: accountId,
+      provider: resolvedProvider,
       name,
       description,
-      apiUrl,
+      apiUrl: resolvedApiUrl,
       priority,
-      supportedModels,
+      supportedModels: resolvedModels,
       userAgent,
       rateLimitDuration,
       isActive,
@@ -197,6 +227,7 @@ class ClaudeConsoleAccountService {
           accounts.push({
             id: accountData.id,
             platform: accountData.platform,
+            provider: accountData.provider || '',
             name: accountData.name,
             description: accountData.description,
             apiUrl: accountData.apiUrl,
@@ -264,6 +295,7 @@ class ClaudeConsoleAccountService {
     )
 
     accountData.apiKey = decryptedKey
+    accountData.provider = accountData.provider || ''
 
     // 解析JSON字段
     const parsedModels = JSON.parse(accountData.supportedModels || '[]')
@@ -310,7 +342,9 @@ class ClaudeConsoleAccountService {
       logger.debug(
         `[DEBUG] Update request received with fields: ${Object.keys(updates).join(', ')}`
       )
-      logger.debug(`[DEBUG] Updates content: ${JSON.stringify(updates, null, 2)}`)
+      logger.debug(
+        `[DEBUG] Updates content: ${JSON.stringify(this._redactAccountSecrets(updates), null, 2)}`
+      )
 
       if (updates.name !== undefined) {
         updatedData.name = updates.name
@@ -318,7 +352,37 @@ class ClaudeConsoleAccountService {
       if (updates.description !== undefined) {
         updatedData.description = updates.description
       }
-      if (updates.apiUrl !== undefined) {
+      if (
+        updates.provider !== undefined ||
+        updates.apiUrl !== undefined ||
+        updates.supportedModels !== undefined
+      ) {
+        const nextProvider =
+          updates.provider !== undefined ? updates.provider : existingAccount.provider
+        const nextUrl = updates.apiUrl !== undefined ? updates.apiUrl : existingAccount.apiUrl
+        const nextModels =
+          updates.supportedModels !== undefined
+            ? updates.supportedModels
+            : existingAccount.supportedModels
+        const providerConfig = deepseekProvider.normalizeAccountConfig({
+          provider: nextProvider,
+          apiUrl: nextUrl,
+          supportedModels: nextModels
+        })
+        if (
+          updates.provider !== undefined ||
+          providerConfig.provider !== (existingAccount.provider || '')
+        ) {
+          updatedData.provider = providerConfig.provider
+        }
+        if (providerConfig.provider === 'deepseek') {
+          updatedData.apiUrl = providerConfig.apiUrl
+          updatedData.supportedModels = JSON.stringify(
+            this._processModelMapping(providerConfig.supportedModels)
+          )
+        }
+      }
+      if (updates.apiUrl !== undefined && updatedData.apiUrl === undefined) {
         logger.debug(`[DEBUG] Updating apiUrl from frontend: ${updates.apiUrl}`)
         updatedData.apiUrl = updates.apiUrl
       }
@@ -329,7 +393,7 @@ class ClaudeConsoleAccountService {
       if (updates.priority !== undefined) {
         updatedData.priority = updates.priority.toString()
       }
-      if (updates.supportedModels !== undefined) {
+      if (updates.supportedModels !== undefined && updatedData.supportedModels === undefined) {
         logger.debug(`[DEBUG] Updating supportedModels: ${JSON.stringify(updates.supportedModels)}`)
         // 处理 supportedModels，确保向后兼容
         const processedModels = this._processModelMapping(updates.supportedModels)

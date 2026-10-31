@@ -10,6 +10,7 @@ const {
   isAccountDisabledError
 } = require('../../utils/errorSanitizer')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const deepseekProvider = require('../deepseekProvider')
 const userMessageQueueService = require('../userMessageQueueService')
 const { isStreamWritable } = require('../../utils/streamHelper')
 const { filterForClaude } = require('../../utils/headerFilter')
@@ -31,6 +32,8 @@ class ClaudeConsoleRelayService {
     options = {}
   ) {
     let abortController = null
+    let handleClientDisconnect = null
+    const attemptStarted = Date.now()
     let account = null
     const requestId = uuidv4() // 用于并发追踪
     let concurrencyAcquired = false
@@ -45,8 +48,20 @@ class ClaudeConsoleRelayService {
           logger.error('❌ accountId missing for queue lock in console relayRequest')
           throw new Error('accountId missing for queue lock')
         }
-        const queueResult = await userMessageQueueService.acquireQueueLock(accountId)
+        const queueBudget = options.officialFirst
+          ? (options.deadline || attemptStarted + options.timeoutMs) - Date.now()
+          : null
+        if (options.officialFirst && queueBudget <= 0)
+          return deepseekProvider.attemptFailure({ code: 'ETIMEDOUT' })
+        const queueResult = await userMessageQueueService.acquireQueueLock(
+          accountId,
+          null,
+          queueBudget
+        )
         if (!queueResult.acquired && !queueResult.skipped) {
+          if (options.officialFirst) {
+            return deepseekProvider.attemptFailure({ code: 'ETIMEDOUT' })
+          }
           // 区分 Redis 后端错误和队列超时
           const isBackendError = queueResult.error === 'queue_backend_error'
           const errorCode = isBackendError ? 'QUEUE_BACKEND_ERROR' : 'QUEUE_TIMEOUT'
@@ -158,10 +173,13 @@ class ClaudeConsoleRelayService {
         }
       }
 
-      // 创建修改后的请求体
-      const modifiedRequestBody = {
+      // 创建修改后的请求体。DeepSeek 只改副本，调用方的请求对象保持原样。
+      let modifiedRequestBody = {
         ...requestBody,
-        model: mappedModel
+        model: options.officialFirst ? 'deepseek-flash' : mappedModel
+      }
+      if (account.provider === 'deepseek') {
+        modifiedRequestBody = deepseekProvider.prepareDeepSeekBody(modifiedRequestBody)
       }
 
       // 模型兼容性检查已经在调度器中完成，这里不需要再检查
@@ -173,7 +191,7 @@ class ClaudeConsoleRelayService {
       abortController = new AbortController()
 
       // 设置客户端断开监听器
-      const handleClientDisconnect = () => {
+      handleClientDisconnect = () => {
         logger.info('🔌 Client disconnected, aborting Claude Console Claude request')
         if (abortController && !abortController.signal.aborted) {
           abortController.abort()
@@ -203,11 +221,15 @@ class ClaudeConsoleRelayService {
 
       logger.debug(`🎯 Final API endpoint: ${apiEndpoint}`)
       logger.debug(`[DEBUG] Options passed to relayRequest: ${JSON.stringify(options)}`)
-      logger.debug(`[DEBUG] Client headers received: ${JSON.stringify(clientHeaders)}`)
+      logger.debug(
+        `[DEBUG] Client headers received: ${JSON.stringify(this._headersForLog(clientHeaders, account))}`
+      )
 
       // 过滤客户端请求头
       const filteredHeaders = this._filterClientHeaders(clientHeaders)
-      logger.debug(`[DEBUG] Filtered client headers: ${JSON.stringify(filteredHeaders)}`)
+      logger.debug(
+        `[DEBUG] Filtered client headers: ${JSON.stringify(this._headersForLog(filteredHeaders, account))}`
+      )
 
       // 决定使用的 User-Agent：优先使用账户自定义的，否则透传客户端的，最后才使用默认值
       const userAgent =
@@ -238,19 +260,10 @@ class ClaudeConsoleRelayService {
         requestConfig.proxy = false
       }
 
-      // 根据 API Key 格式选择认证方式
-      if (account.apiKey && account.apiKey.startsWith('sk-ant-')) {
-        // Anthropic 官方 API Key 使用 x-api-key
-        requestConfig.headers['x-api-key'] = account.apiKey
-        logger.debug('[DEBUG] Using x-api-key authentication for sk-ant-* API key')
-      } else {
-        // 其他 API Key 使用 Authorization Bearer
-        requestConfig.headers['Authorization'] = `Bearer ${account.apiKey}`
-        logger.debug('[DEBUG] Using Authorization Bearer authentication')
-      }
+      this._applyUpstreamAuth(requestConfig.headers, account)
 
       logger.debug(
-        `[DEBUG] Initial headers before beta: ${JSON.stringify(requestConfig.headers, null, 2)}`
+        `[DEBUG] Initial headers before beta: ${JSON.stringify(this._headersForLog(requestConfig.headers, account), null, 2)}`
       )
 
       // 添加beta header如果需要
@@ -264,9 +277,17 @@ class ClaudeConsoleRelayService {
       // 发送请求
       logger.debug(
         '📤 Sending request to Claude Console API with headers:',
-        JSON.stringify(requestConfig.headers, null, 2)
+        JSON.stringify(this._headersForLog(requestConfig.headers, account), null, 2)
       )
+      if (options.officialFirst) {
+        const remaining = (options.deadline || attemptStarted + options.timeoutMs) - Date.now()
+        if (remaining <= 0) return deepseekProvider.attemptFailure({ code: 'ETIMEDOUT' })
+        requestConfig.timeout = remaining
+      }
       const response = await axios(requestConfig)
+      const attemptResult = options.officialFirst
+        ? deepseekProvider.attemptFailure({ status: response.status, headers: response.headers })
+        : null
 
       // 📬 请求已发送成功，立即释放队列锁（无需等待响应处理完成）
       // 因为 Claude API 限流基于请求发送时刻计算（RPM），不是请求完成时刻
@@ -280,7 +301,7 @@ class ClaudeConsoleRelayService {
         } catch (releaseError) {
           logger.error(
             `❌ Failed to release user message queue lock early for console account ${accountId}:`,
-            releaseError.message
+            this._safeError(releaseError, account, accountId).message
           )
         }
       }
@@ -293,6 +314,10 @@ class ClaudeConsoleRelayService {
         clientResponse.removeListener('close', handleClientDisconnect)
       }
 
+      if (account.provider === 'deepseek' && (response.status < 200 || response.status >= 300)) {
+        response.data = deepseekProvider.safeErrorPayload()
+        response.headers = {}
+      }
       logger.debug(`🔗 Claude Console API response: ${response.status}`)
       logger.debug(`[DEBUG] Response headers: ${JSON.stringify(response.headers)}`)
       logger.debug(`[DEBUG] Response data type: ${typeof response.data}`)
@@ -305,8 +330,9 @@ class ClaudeConsoleRelayService {
         // 记录原始错误响应（包含供应商信息，用于调试）
         const rawData =
           typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
+        const loggedRaw = this._redactAccountSecret(rawData, account)
         logger.error(
-          `📝 Upstream error response from ${account?.name || accountId}: ${rawData.substring(0, 500)}`
+          `📝 Upstream error response from ${account?.name || accountId}: ${String(loggedRaw).substring(0, 500)}`
         )
 
         // 记录清理后的数据到error
@@ -314,12 +340,16 @@ class ClaudeConsoleRelayService {
           const responseData =
             typeof response.data === 'string' ? JSON.parse(response.data) : response.data
           const sanitizedData = sanitizeUpstreamError(responseData)
-          logger.error(`🧹 [SANITIZED] Error response to client: ${JSON.stringify(sanitizedData)}`)
+          logger.error(
+            `🧹 [SANITIZED] Error response to client: ${this._redactAccountSecret(JSON.stringify(sanitizedData), account)}`
+          )
         } catch (e) {
           const rawText =
             typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
           const sanitizedText = sanitizeErrorMessage(rawText)
-          logger.error(`🧹 [SANITIZED] Error response to client: ${sanitizedText}`)
+          logger.error(
+            `🧹 [SANITIZED] Error response to client: ${this._redactAccountSecret(sanitizedText, account)}`
+          )
         }
       } else {
         logger.debug(
@@ -328,7 +358,10 @@ class ClaudeConsoleRelayService {
       }
 
       // 检查是否为账户禁用/不可用的 400 错误
-      const accountDisabledError = isAccountDisabledError(response.status, response.data)
+      const accountDisabledError =
+        account.provider === 'deepseek'
+          ? false
+          : isAccountDisabledError(response.status, response.data)
 
       // 检查错误状态并相应处理
       if (response.status === 401) {
@@ -356,7 +389,10 @@ class ClaudeConsoleRelayService {
         )
         // 收到429先检查是否因为超过了手动配置的每日额度
         await claudeConsoleAccountService.checkQuotaUsage(accountId).catch((err) => {
-          logger.error('❌ Failed to check quota after 429 error:', err)
+          logger.error(
+            '❌ Failed to check quota after 429 error:',
+            this._safeError(err, account, accountId)
+          )
         })
 
         if (!autoProtectionDisabled) {
@@ -426,9 +462,11 @@ class ClaudeConsoleRelayService {
         responseBody =
           typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
       }
+      responseBody = this._redactAccountSecret(responseBody, account)
 
       logger.debug(`[DEBUG] Final response body to return: ${responseBody.substring(0, 200)}...`)
 
+      if (attemptResult?.fallback) return attemptResult
       return {
         statusCode: response.status,
         headers: response.headers,
@@ -436,6 +474,10 @@ class ClaudeConsoleRelayService {
         accountId
       }
     } catch (error) {
+      if (options.officialFirst && !abortController?.signal.aborted && !clientResponse?.destroyed) {
+        const attemptResult = deepseekProvider.attemptFailure({ code: error.code })
+        if (attemptResult.fallback) return attemptResult
+      }
       // 处理特定错误
       if (
         error.name === 'AbortError' ||
@@ -447,15 +489,20 @@ class ClaudeConsoleRelayService {
         throw new Error('Client disconnected')
       }
 
+      error = this._safeError(error, account, accountId)
       logger.error(
         `❌ Claude Console relay request failed (Account: ${account?.name || accountId}):`,
-        error.message
+        this._redactAccountSecret(error.message, account)
       )
 
       // 不再因为模型不支持而block账号
 
       throw error
     } finally {
+      if (handleClientDisconnect) {
+        clientRequest?.removeListener('close', handleClientDisconnect)
+        clientResponse?.removeListener('close', handleClientDisconnect)
+      }
       // 🔓 并发控制：释放并发槽位
       if (concurrencyAcquired) {
         try {
@@ -466,7 +513,7 @@ class ClaudeConsoleRelayService {
         } catch (releaseError) {
           logger.error(
             `❌ Failed to release concurrency slot for account ${accountId}, request: ${requestId}:`,
-            releaseError.message
+            this._safeError(releaseError, account, accountId).message
           )
         }
       }
@@ -481,7 +528,7 @@ class ClaudeConsoleRelayService {
         } catch (releaseError) {
           logger.error(
             `❌ Failed to release user message queue lock for account ${accountId}:`,
-            releaseError.message
+            this._safeError(releaseError, account, accountId).message
           )
         }
       }
@@ -500,6 +547,7 @@ class ClaudeConsoleRelayService {
     options = {}
   ) {
     let account = null
+    const attemptStarted = Date.now()
     const requestId = uuidv4() // 用于并发追踪
     let concurrencyAcquired = false
     let leaseRefreshInterval = null // 租约刷新定时器
@@ -516,8 +564,20 @@ class ClaudeConsoleRelayService {
           )
           throw new Error('accountId missing for queue lock')
         }
-        const queueResult = await userMessageQueueService.acquireQueueLock(accountId)
+        const queueBudget = options.officialFirst
+          ? (options.deadline || attemptStarted + options.timeoutMs) - Date.now()
+          : null
+        if (options.officialFirst && queueBudget <= 0)
+          return deepseekProvider.attemptFailure({ code: 'ETIMEDOUT' })
+        const queueResult = await userMessageQueueService.acquireQueueLock(
+          accountId,
+          null,
+          queueBudget
+        )
         if (!queueResult.acquired && !queueResult.skipped) {
+          if (options.officialFirst) {
+            return deepseekProvider.attemptFailure({ code: 'ETIMEDOUT' })
+          }
           // 区分 Redis 后端错误和队列超时
           const isBackendError = queueResult.error === 'queue_backend_error'
           const errorCode = isBackendError ? 'QUEUE_BACKEND_ERROR' : 'QUEUE_TIMEOUT'
@@ -617,7 +677,7 @@ class ClaudeConsoleRelayService {
             } catch (refreshError) {
               logger.error(
                 `❌ Failed to refresh concurrency lease for account ${accountId}, request: ${requestId}:`,
-                refreshError.message
+                this._safeError(refreshError, account, accountId).message
               )
             }
           },
@@ -644,10 +704,12 @@ class ClaudeConsoleRelayService {
         }
       }
 
-      // 创建修改后的请求体
-      const modifiedRequestBody = {
+      let modifiedRequestBody = {
         ...requestBody,
-        model: mappedModel
+        model: options.officialFirst ? 'deepseek-flash' : mappedModel
+      }
+      if (account.provider === 'deepseek') {
+        modifiedRequestBody = deepseekProvider.prepareDeepSeekBody(modifiedRequestBody)
       }
 
       // 模型兼容性检查已经在调度器中完成，这里不需要再检查
@@ -655,8 +717,15 @@ class ClaudeConsoleRelayService {
       // 创建代理agent
       const proxyAgent = claudeConsoleAccountService._createProxyAgent(account.proxy)
 
+      if (options.officialFirst) {
+        options = {
+          ...options,
+          timeoutMs: (options.deadline || attemptStarted + options.timeoutMs) - Date.now()
+        }
+        if (options.timeoutMs <= 0) return deepseekProvider.attemptFailure({ code: 'ETIMEDOUT' })
+      }
       // 发送流式请求
-      await this._makeClaudeConsoleStreamRequest(
+      const attemptResult = await this._makeClaudeConsoleStreamRequest(
         modifiedRequestBody,
         account,
         proxyAgent,
@@ -678,7 +747,7 @@ class ClaudeConsoleRelayService {
             } catch (releaseError) {
               logger.error(
                 `❌ Failed to release user message queue lock early for console stream account ${accountId}:`,
-                releaseError.message
+                this._safeError(releaseError, account, accountId).message
               )
             }
           }
@@ -687,7 +756,9 @@ class ClaudeConsoleRelayService {
 
       // 更新最后使用时间
       await this._updateLastUsedTime(accountId)
+      return attemptResult
     } catch (error) {
+      error = this._safeError(error, account, accountId)
       // 客户端主动断开连接是正常情况，使用 INFO 级别
       if (error.message === 'Client disconnected') {
         logger.info(
@@ -719,7 +790,7 @@ class ClaudeConsoleRelayService {
         } catch (releaseError) {
           logger.error(
             `❌ Failed to release concurrency slot for stream account ${accountId}, request: ${requestId}:`,
-            releaseError.message
+            this._safeError(releaseError, account, accountId).message
           )
         }
       }
@@ -734,7 +805,7 @@ class ClaudeConsoleRelayService {
         } catch (releaseError) {
           logger.error(
             `❌ Failed to release user message queue lock for stream account ${accountId}:`,
-            releaseError.message
+            this._safeError(releaseError, account, accountId).message
           )
         }
       }
@@ -756,6 +827,18 @@ class ClaudeConsoleRelayService {
   ) {
     return new Promise((resolve, reject) => {
       let aborted = false
+      let settled = false
+      let upstreamStream = null
+      let committed = false
+      let responseStatus = null
+      let firstByteTimer = null
+      const finishAttempt = (result) => {
+        settled = true
+        clearTimeout(firstByteTimer)
+        stopHeartbeat()
+        resolve(result)
+        upstreamStream?.destroy()
+      }
       // 上游 thinking 静默 >120s 会触发 CF 524；声明心跳句柄，200 成功路径启动、各种结束/异常路径统一清理。
       // 💓 W1：若上游已在联系上游前启动心跳并通过 options 传入，则复用同一句柄，避免重复启动第二个定时器。
       let heartbeat = requestOptions.heartbeat || null
@@ -763,6 +846,42 @@ class ClaudeConsoleRelayService {
         if (heartbeat) {
           heartbeat.stop()
           heartbeat = null
+        }
+      }
+
+      const failDeepSeek = (original) => {
+        if (settled || aborted) {
+          return
+        }
+        const failure = deepseekProvider.attemptFailure({
+          status: responseStatus && responseStatus !== 200 ? responseStatus : undefined,
+          code: original?.code,
+          committed
+        })
+        if (requestOptions.officialFirst && failure.fallback && !responseStream.headersSent) {
+          finishAttempt(failure)
+          return
+        }
+        settled = true
+        clearTimeout(firstByteTimer)
+        stopHeartbeat()
+        const error = deepseekProvider.safeError(original, accountId)
+        logger.error('DeepSeek stream failed:', error)
+        if (isStreamWritable(responseStream)) {
+          if (!responseStream.headersSent) {
+            responseStream.writeHead(500, { 'Content-Type': 'text/event-stream' })
+          }
+          const payload = streamTransformer
+            ? { type: 'error', error: error.message }
+            : deepseekProvider.safeErrorPayload()
+          responseStream.write(
+            `${streamTransformer ? '' : 'event: error\n'}data: ${JSON.stringify(payload)}\n\n`
+          )
+          responseStream.end()
+        }
+        reject(error)
+        if (upstreamStream) {
+          upstreamStream.destroy()
         }
       }
 
@@ -784,6 +903,7 @@ class ClaudeConsoleRelayService {
         this.defaultUserAgent
 
       // 准备请求配置
+      const abortController = account.provider === 'deepseek' ? new AbortController() : null
       const requestConfig = {
         method: 'POST',
         url: apiEndpoint,
@@ -796,7 +916,8 @@ class ClaudeConsoleRelayService {
         },
         timeout: config.requestTimeout || 600000,
         responseType: 'stream',
-        validateStatus: () => true // 接受所有状态码
+        validateStatus: () => true, // 接受所有状态码
+        signal: abortController ? abortController.signal : undefined
       }
 
       if (proxyAgent) {
@@ -805,22 +926,19 @@ class ClaudeConsoleRelayService {
         requestConfig.proxy = false
       }
 
-      // 根据 API Key 格式选择认证方式
-      if (account.apiKey && account.apiKey.startsWith('sk-ant-')) {
-        // Anthropic 官方 API Key 使用 x-api-key
-        requestConfig.headers['x-api-key'] = account.apiKey
-        logger.debug('[DEBUG] Using x-api-key authentication for sk-ant-* API key')
-      } else {
-        // 其他 API Key 使用 Authorization Bearer
-        requestConfig.headers['Authorization'] = `Bearer ${account.apiKey}`
-        logger.debug('[DEBUG] Using Authorization Bearer authentication')
-      }
+      this._applyUpstreamAuth(requestConfig.headers, account)
 
       // 添加beta header如果需要
       if (requestOptions.betaHeader) {
         requestConfig.headers['anthropic-beta'] = requestOptions.betaHeader
       }
 
+      if (requestOptions.officialFirst) {
+        firstByteTimer = setTimeout(() => {
+          failDeepSeek({ code: 'ETIMEDOUT' })
+          abortController?.abort()
+        }, requestOptions.timeoutMs)
+      }
       // 发送请求
       const request = axios(requestConfig)
 
@@ -829,7 +947,22 @@ class ClaudeConsoleRelayService {
       // - queueLockAcquired = false 的赋值会在 finally 执行前完成（JS 单线程保证）
       request
         .then(async (response) => {
+          responseStatus = response.status
           logger.debug(`🌊 Claude Console Claude stream response status: ${response.status}`)
+          if (account.provider === 'deepseek') {
+            upstreamStream = response.data
+            upstreamStream.on('error', failDeepSeek)
+            if (aborted || settled) {
+              upstreamStream.destroy()
+              return
+            }
+            if (response.status === 200) {
+              const safeStream = deepseekProvider.createSafeEventStream()
+              safeStream.on('error', failDeepSeek)
+              upstreamStream.pipe(safeStream)
+              response.data = safeStream
+            }
+          }
 
           // 错误响应处理
           if (response.status !== 200) {
@@ -842,116 +975,155 @@ class ClaudeConsoleRelayService {
             const errorChunks = []
 
             response.data.on('data', (chunk) => {
-              errorChunks.push(chunk)
-              errorDataForCheck += chunk.toString()
+              if (account.provider !== 'deepseek') {
+                errorChunks.push(chunk)
+                errorDataForCheck += chunk.toString()
+              }
             })
 
             response.data.on('end', async () => {
-              const autoProtectionDisabled = account.disableAutoProtection === true
-              // 记录原始错误消息到日志（方便调试，包含供应商信息）
-              logger.error(
-                `📝 [Stream] Upstream error response from ${account?.name || accountId}: ${errorDataForCheck.substring(0, 500)}`
-              )
-
-              // 检查是否为账户禁用错误
-              const accountDisabledError = isAccountDisabledError(
-                response.status,
-                errorDataForCheck
-              )
-
-              if (response.status === 401) {
-                logger.warn(
-                  `🚫 [Stream] Unauthorized error detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
-                )
-                if (!autoProtectionDisabled) {
-                  await upstreamErrorHelper
-                    .markTempUnavailable(accountId, 'claude-console', 401)
-                    .catch(() => {})
+              if (account.provider === 'deepseek') {
+                if (settled || aborted) {
+                  return
                 }
-              } else if (accountDisabledError) {
-                logger.error(
-                  `🚫 [Stream] Account disabled error (400) detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
-                )
-                // 传入完整的错误详情到 webhook
-                if (!autoProtectionDisabled) {
-                  await claudeConsoleAccountService.markConsoleAccountBlocked(
-                    accountId,
-                    errorDataForCheck
-                  )
-                }
-              } else if (response.status === 429) {
-                logger.warn(
-                  `🚫 [Stream] Rate limit detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
-                )
-                // 检查是否因为超过每日额度
-                claudeConsoleAccountService.checkQuotaUsage(accountId).catch((err) => {
-                  logger.error('❌ Failed to check quota after 429 error:', err)
-                })
-                if (!autoProtectionDisabled) {
-                  await claudeConsoleAccountService.markAccountRateLimited(accountId)
-                  await upstreamErrorHelper
-                    .markTempUnavailable(
-                      accountId,
-                      'claude-console',
-                      429,
-                      upstreamErrorHelper.parseRetryAfter(response.headers)
-                    )
-                    .catch(() => {})
-                }
-              } else if (response.status === 529) {
-                logger.warn(
-                  `🚫 [Stream] Overload error detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
-                )
-                if (!autoProtectionDisabled) {
-                  await claudeConsoleAccountService.markAccountOverloaded(accountId)
-                  await upstreamErrorHelper
-                    .markTempUnavailable(accountId, 'claude-console', 529)
-                    .catch(() => {})
-                }
-              } else if (response.status >= 500) {
-                logger.warn(
-                  `🔥 [Stream] Server error (${response.status}) detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
-                )
-                if (!autoProtectionDisabled) {
-                  await upstreamErrorHelper
-                    .markTempUnavailable(accountId, 'claude-console', response.status)
-                    .catch(() => {})
-                }
+                errorDataForCheck = JSON.stringify(deepseekProvider.safeErrorPayload())
+                errorChunks.push(Buffer.from(errorDataForCheck))
               }
-
-              // 设置响应头
-              if (!responseStream.headersSent) {
-                responseStream.writeHead(response.status, {
-                  'Content-Type': 'application/json',
-                  'Cache-Control': 'no-cache'
-                })
-              }
-
-              // 清理并发送错误响应
               try {
-                const fullErrorData = Buffer.concat(errorChunks).toString()
-                const errorJson = JSON.parse(fullErrorData)
-                const sanitizedError = sanitizeUpstreamError(errorJson)
-
-                // 记录清理后的错误消息（发送给客户端的，完整记录）
+                const autoProtectionDisabled = account.disableAutoProtection === true
+                // 记录原始错误消息到日志（方便调试，包含供应商信息）
                 logger.error(
-                  `🧹 [Stream] [SANITIZED] Error response to client: ${JSON.stringify(sanitizedError)}`
+                  `📝 [Stream] Upstream error response from ${account?.name || accountId}: ${String(this._redactAccountSecret(errorDataForCheck, account)).substring(0, 500)}`
                 )
 
-                if (isStreamWritable(responseStream)) {
-                  responseStream.write(JSON.stringify(sanitizedError))
-                  responseStream.end()
-                }
-              } catch (parseError) {
-                const sanitizedText = sanitizeErrorMessage(errorDataForCheck)
-                logger.error(`🧹 [Stream] [SANITIZED] Error response to client: ${sanitizedText}`)
+                // 检查是否为账户禁用错误
+                const accountDisabledError =
+                  account.provider === 'deepseek'
+                    ? false
+                    : isAccountDisabledError(response.status, errorDataForCheck)
 
-                if (isStreamWritable(responseStream)) {
-                  responseStream.write(sanitizedText)
-                  responseStream.end()
+                if (response.status === 401) {
+                  logger.warn(
+                    `🚫 [Stream] Unauthorized error detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
+                  )
+                  if (!autoProtectionDisabled) {
+                    await upstreamErrorHelper
+                      .markTempUnavailable(accountId, 'claude-console', 401)
+                      .catch(() => {})
+                  }
+                } else if (accountDisabledError) {
+                  logger.error(
+                    `🚫 [Stream] Account disabled error (400) detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
+                  )
+                  // 传入完整的错误详情到 webhook
+                  if (!autoProtectionDisabled) {
+                    await claudeConsoleAccountService.markConsoleAccountBlocked(
+                      accountId,
+                      errorDataForCheck
+                    )
+                  }
+                } else if (response.status === 429) {
+                  logger.warn(
+                    `🚫 [Stream] Rate limit detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
+                  )
+                  // 检查是否因为超过每日额度
+                  claudeConsoleAccountService.checkQuotaUsage(accountId).catch((err) => {
+                    logger.error(
+                      '❌ Failed to check quota after 429 error:',
+                      this._safeError(err, account, accountId)
+                    )
+                  })
+                  if (!autoProtectionDisabled) {
+                    await claudeConsoleAccountService.markAccountRateLimited(accountId)
+                    await upstreamErrorHelper
+                      .markTempUnavailable(
+                        accountId,
+                        'claude-console',
+                        429,
+                        upstreamErrorHelper.parseRetryAfter(response.headers)
+                      )
+                      .catch(() => {})
+                  }
+                } else if (response.status === 529) {
+                  logger.warn(
+                    `🚫 [Stream] Overload error detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
+                  )
+                  if (!autoProtectionDisabled) {
+                    await claudeConsoleAccountService.markAccountOverloaded(accountId)
+                    await upstreamErrorHelper
+                      .markTempUnavailable(accountId, 'claude-console', 529)
+                      .catch(() => {})
+                  }
+                } else if (response.status >= 500) {
+                  logger.warn(
+                    `🔥 [Stream] Server error (${response.status}) detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
+                  )
+                  if (!autoProtectionDisabled) {
+                    await upstreamErrorHelper
+                      .markTempUnavailable(accountId, 'claude-console', response.status)
+                      .catch(() => {})
+                  }
+                }
+
+                const failure = deepseekProvider.attemptFailure({
+                  status: response.status,
+                  headers: response.headers
+                })
+                if (
+                  requestOptions.officialFirst &&
+                  failure.fallback &&
+                  !responseStream.headersSent
+                ) {
+                  finishAttempt(failure)
+                  return
+                }
+                clearTimeout(firstByteTimer)
+                // 设置响应头
+                if (!responseStream.headersSent) {
+                  responseStream.writeHead(response.status, {
+                    'Content-Type': 'application/json',
+                    'Cache-Control': 'no-cache'
+                  })
+                }
+
+                // 清理并发送错误响应
+                try {
+                  const fullErrorData = Buffer.concat(errorChunks).toString()
+                  const errorJson = JSON.parse(fullErrorData)
+                  const sanitizedError = sanitizeUpstreamError(errorJson)
+
+                  // 记录清理后的错误消息（发送给客户端的，完整记录）
+                  logger.error(
+                    `🧹 [Stream] [SANITIZED] Error response to client: ${this._redactAccountSecret(JSON.stringify(sanitizedError), account)}`
+                  )
+
+                  if (isStreamWritable(responseStream)) {
+                    responseStream.write(
+                      this._redactAccountSecret(JSON.stringify(sanitizedError), account)
+                    )
+                    responseStream.end()
+                  }
+                } catch (parseError) {
+                  const sanitizedText = sanitizeErrorMessage(errorDataForCheck)
+                  logger.error(
+                    `🧹 [Stream] [SANITIZED] Error response to client: ${this._redactAccountSecret(sanitizedText, account)}`
+                  )
+
+                  if (isStreamWritable(responseStream)) {
+                    responseStream.write(sanitizedText)
+                    responseStream.end()
+                  }
+                }
+                settled = true
+                stopHeartbeat()
+                resolve() // 不抛出异常，正常完成流处理
+              } catch (error) {
+                if (account.provider === 'deepseek') {
+                  failDeepSeek(error)
+                } else {
+                  reject(error)
                 }
               }
-              resolve() // 不抛出异常，正常完成流处理
             })
 
             return
@@ -965,7 +1137,7 @@ class ClaudeConsoleRelayService {
             } catch (callbackError) {
               logger.error(
                 `❌ Failed to execute onResponseHeaderReceived callback for console stream account ${accountId}:`,
-                callbackError.message
+                this._safeError(callbackError, account, accountId).message
               )
             }
           }
@@ -982,36 +1154,39 @@ class ClaudeConsoleRelayService {
             }
           })
 
-          // 设置响应头
-          // ⚠️ 关键修复：尊重 auth.js 提前设置的 Connection: close
-          // 当并发队列功能启用时，auth.js 会设置 Connection: close 来禁用 Keep-Alive
-          if (!responseStream.headersSent) {
-            const existingConnection = responseStream.getHeader
-              ? responseStream.getHeader('Connection')
-              : null
-            const connectionHeader = existingConnection || 'keep-alive'
-            if (existingConnection) {
-              logger.debug(
-                `🔌 [Console Stream] Preserving existing Connection header: ${existingConnection}`
-              )
+          const commitStream = () => {
+            // 设置响应头
+            // ⚠️ 关键修复：尊重 auth.js 提前设置的 Connection: close
+            // 当并发队列功能启用时，auth.js 会设置 Connection: close 来禁用 Keep-Alive
+            if (!responseStream.headersSent) {
+              const existingConnection = responseStream.getHeader
+                ? responseStream.getHeader('Connection')
+                : null
+              const connectionHeader = existingConnection || 'keep-alive'
+              if (existingConnection) {
+                logger.debug(
+                  `🔌 [Console Stream] Preserving existing Connection header: ${existingConnection}`
+                )
+              }
+              responseStream.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                Connection: connectionHeader,
+                'X-Accel-Buffering': 'no'
+              })
             }
-            responseStream.writeHead(200, {
-              'Content-Type': 'text/event-stream',
-              'Cache-Control': 'no-cache',
-              Connection: connectionHeader,
-              'X-Accel-Buffering': 'no'
-            })
-          }
 
-          // 💓 启动 SSE 心跳：上游 thinking 期间静默 >120s 会被 Cloudflare 524，
-          // 每 15s 在客户端连接上写入 `: heartbeat\n\n` 注释保活。
-          // 若已由上游预先启动并传入（W1），复用同一句柄，避免重复启动第二个定时器。
-          if (!heartbeat) {
-            heartbeat = attachHeartbeat(responseStream, {
-              logger,
-              label: `Console:${account?.name || accountId}`
-            })
+            // 💓 启动 SSE 心跳：上游 thinking 期间静默 >120s 会被 Cloudflare 524，
+            // 每 15s 在客户端连接上写入 `: heartbeat\n\n` 注释保活。
+            // 若已由上游预先启动并传入（W1），复用同一句柄，避免重复启动第二个定时器。
+            if (!heartbeat) {
+              heartbeat = attachHeartbeat(responseStream, {
+                logger,
+                label: `Console:${account?.name || accountId}`
+              })
+            }
           }
+          if (!requestOptions.officialFirst) commitStream()
 
           let buffer = ''
           let finalUsageReported = false
@@ -1023,10 +1198,13 @@ class ClaudeConsoleRelayService {
           response.data.setEncoding('utf8')
           response.data.on('data', (chunk) => {
             try {
-              if (aborted) {
+              if (aborted || (account.provider === 'deepseek' && settled)) {
                 return
               }
 
+              committed = true
+              clearTimeout(firstByteTimer)
+              if (requestOptions.officialFirst) commitStream()
               const chunkStr = chunk.toString()
               buffer += chunkStr
 
@@ -1150,6 +1328,10 @@ class ClaudeConsoleRelayService {
                           if (!collectedUsageData.model) {
                             collectedUsageData.model = body.model || account?.defaultModel || null
                           }
+                          collectedUsageData.model = this._canonicalUsageModel(
+                            collectedUsageData.model,
+                            account
+                          )
                           logger.info(
                             '🎯 [Console] Complete usage data collected:',
                             JSON.stringify(collectedUsageData)
@@ -1169,6 +1351,10 @@ class ClaudeConsoleRelayService {
                 }
               }
             } catch (error) {
+              if (account.provider === 'deepseek') {
+                failDeepSeek(error)
+                return
+              }
               logger.error(
                 `❌ Error processing Claude Console stream data (Account: ${account?.name || accountId}):`,
                 error
@@ -1194,6 +1380,10 @@ class ClaudeConsoleRelayService {
           })
 
           response.data.on('end', () => {
+            clearTimeout(firstByteTimer)
+            if (account.provider === 'deepseek' && (settled || aborted)) {
+              return
+            }
             // 💓 上游已结束，停止心跳计时器
             stopHeartbeat()
             try {
@@ -1232,6 +1422,10 @@ class ClaudeConsoleRelayService {
                   if (!collectedUsageData.model) {
                     collectedUsageData.model = body.model || account?.defaultModel || null
                   }
+                  collectedUsageData.model = this._canonicalUsageModel(
+                    collectedUsageData.model,
+                    account
+                  )
                   logger.info(
                     `📊 [Console] Saving incomplete usage data via fallback: ${JSON.stringify(collectedUsageData)}`
                   )
@@ -1261,6 +1455,7 @@ class ClaudeConsoleRelayService {
                 }
 
                 // 等待数据完全 flush 到客户端后再 resolve
+                settled = true
                 responseStream.end(() => {
                   logger.info(
                     `✅ [STREAM] Response ended and flushed | socketBytesWritten: ${responseStream.socket?.bytesWritten || 'unknown'}`
@@ -1275,12 +1470,20 @@ class ClaudeConsoleRelayService {
                 resolve()
               }
             } catch (error) {
+              if (account.provider === 'deepseek') {
+                failDeepSeek(error)
+                return
+              }
               logger.error('❌ Error processing stream end:', error)
               reject(error)
             }
           })
 
           response.data.on('error', (error) => {
+            if (account.provider === 'deepseek') {
+              failDeepSeek(error)
+              return
+            }
             // 💓 上游流异常，停止心跳
             stopHeartbeat()
             logger.error(
@@ -1317,7 +1520,7 @@ class ClaudeConsoleRelayService {
 
           logger.error(
             `❌ Claude Console stream request error (Account: ${account?.name || accountId}):`,
-            error.message
+            this._safeError(error, account, accountId).message
           )
 
           // 检查错误状态
@@ -1335,7 +1538,10 @@ class ClaudeConsoleRelayService {
                 claudeConsoleAccountService.markAccountRateLimited(accountId)
                 // 检查是否因为超过每日额度
                 claudeConsoleAccountService.checkQuotaUsage(accountId).catch((err) => {
-                  logger.error('❌ Failed to check quota after 429 error:', err)
+                  logger.error(
+                    '❌ Failed to check quota after 429 error:',
+                    this._safeError(err, account, accountId)
+                  )
                 })
                 upstreamErrorHelper
                   .markTempUnavailable(
@@ -1356,6 +1562,10 @@ class ClaudeConsoleRelayService {
             }
           }
 
+          if (account.provider === 'deepseek') {
+            failDeepSeek(error)
+            return
+          }
           // 发送错误响应
           if (!responseStream.headersSent) {
             const existingConnection = responseStream.getHeader
@@ -1393,11 +1603,63 @@ class ClaudeConsoleRelayService {
       // 处理客户端断开连接
       responseStream.on('close', () => {
         // 💓 客户端已断开，停止心跳
+        clearTimeout(firstByteTimer)
         stopHeartbeat()
         logger.debug('🔌 Client disconnected, cleaning up Claude Console stream')
         aborted = true
+        if (account.provider === 'deepseek' && !settled) {
+          settled = true
+          resolve()
+          if (upstreamStream) {
+            upstreamStream.destroy()
+          }
+        }
+        if (abortController && !abortController.signal.aborted) {
+          abortController.abort()
+        }
       })
     })
+  }
+
+  _safeError(error, account, accountId) {
+    return account?.provider === 'deepseek' ? deepseekProvider.safeError(error, accountId) : error
+  }
+
+  _canonicalUsageModel(model, account) {
+    if (!account || account.provider !== 'deepseek') {
+      return model
+    }
+    return deepseekProvider.canonicalDeepSeekModel(model) || model
+  }
+
+  _applyUpstreamAuth(headers, account) {
+    if (account && account.provider === 'deepseek') {
+      delete headers.Authorization
+      delete headers.authorization
+      headers['x-api-key'] = account.apiKey
+      return
+    }
+    if (account.apiKey && account.apiKey.startsWith('sk-ant-')) {
+      headers['x-api-key'] = account.apiKey
+      logger.debug('[DEBUG] Using x-api-key authentication for sk-ant-* API key')
+      return
+    }
+    headers.Authorization = `Bearer ${account.apiKey}`
+    logger.debug('[DEBUG] Using Authorization Bearer authentication')
+  }
+
+  _headersForLog(headers, account) {
+    if (account && account.provider === 'deepseek') {
+      return deepseekProvider.redactAuthHeaders(headers)
+    }
+    return headers
+  }
+
+  _redactAccountSecret(value, account) {
+    if (!account || account.provider !== 'deepseek') {
+      return value
+    }
+    return deepseekProvider.redactSecret(value, account.apiKey)
   }
 
   // 🔧 过滤客户端请求头
@@ -1517,7 +1779,10 @@ class ClaudeConsoleRelayService {
         extraHeaders
       }
 
-      if (account.apiKey && account.apiKey.startsWith('sk-ant-')) {
+      if (
+        account.provider === 'deepseek' ||
+        (account.apiKey && account.apiKey.startsWith('sk-ant-'))
+      ) {
         requestOptions.extraHeaders['x-api-key'] = account.apiKey
       } else {
         requestOptions.authorization = `Bearer ${account.apiKey}`

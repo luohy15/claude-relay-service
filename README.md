@@ -30,7 +30,6 @@
 
 📖 **免责声明**: 本项目仅供技术学习和研究使用，作者不对因使用本项目导致的账户封禁、服务中断或其他损失承担任何责任。
 
-
 ## 🤔 这个项目适合你吗？
 
 - 🌍 **地区限制**: 所在地区无法直接访问Claude Code服务？
@@ -82,6 +81,22 @@
 - 📊 **监控面板**: Web界面查看所有数据
 - 🛡️ **安全控制**: 访问限制、速率控制、客户端限制
 - 🌐 **代理支持**: 支持HTTP/SOCKS5代理
+
+### DeepSeek
+
+在管理后台的 Claude Console 账户里选择 DeepSeek 预设。密钥只通过已登录的管理接口写入，并沿用 Console 账户的 AES 存储；不要把真实密钥放进环境变量、配置文件或日志。
+
+- 上游：`https://api.deepseek.com/anthropic`（也接受官方的 `/anthropic/v1/messages`）。认证头是 `x-api-key`，与密钥前缀无关。
+- 权限仍使用 API Key 的 `claude`。客户端继续请求 `/api/v1/messages` 或 `/claude/v1/messages`。
+- 当前模型只有 `deepseek-flash` 和 `deepseek-v4-pro`。`deepseek-v4-flash` 与 `deepseek-v4-flash-vision-exp` 会规范成 Flash。不要使用已停用的 `deepseek-chat` / `deepseek-reasoner`，也不要指望 Claude 模型名自动改写。除下面的 Flash 官方优先规则外，带 `/` 的 OpenRouter id 仍走原来的 OpenRouter 路径。
+- `/api/v1/messages` 的 `deepseek/deepseek-v4.1-flash-1017`、`deepseek/deepseek-v4.1-flash`（含 `[1m]`）优先使用官方 `deepseek-flash`，不会映射到 Pro。需要 `claude` 权限和可用的 DeepSeek Console 账户；否则直接走原来的 OpenRouter 路径。官方不支持的内容也直接走 OpenRouter。原生 `deepseek-*` 保持官方单一路径。
+- 官方阶段最多尝试两次。连接拒绝/重置、首响应超时、408、429、500/502/503/504/529 可重试，通常等待 1 秒；429 遵守 Retry-After，上限 10 秒。流式首字节等待预算 75 秒，非流式 180 秒。失败后最多调用一次原有 OpenRouter 路径，不新增 provider/ignore 或数据收集设置。
+- 其他 4xx、客户端取消或已经输出的流不会切换供应商，避免拼接两个回答或重复工具调用。激活需要在部署环境通过已有加密 Console 账户入口配置密钥，并保留 OpenRouter 权限和账户作为回退。代码变更本身不配置真实密钥。
+- 除官方优先 Flash 外，不带 `deepseek-` 前缀的请求不会选中 DeepSeek 账户；原生 DeepSeek 请求也不会落到普通 Console、官方、Bedrock 或 CCR 账户。
+- `thinking` 不传时由 DeepSeek 默认开启（high）。显式 `disabled` 会原样转发。`budget_tokens`、`cache_control` 和 `disable_parallel_tool_use` 上游会忽略，不构成可用保证。
+- `document`、`search_result`、`redacted_thinking`、MCP、container、code execution，以及文件型图片和本服务未开启的服务端 search/fetch，会在出网前返回 400。
+- `count_tokens` 若上游返回 404，中继回 `input_tokens: 0`。这是占位，不是真实估算。
+- 费用按官方峰时价估算（每百万 token，Flash 输入/缓存命中/输出 = 0.30/0.006/1.20，Pro = 1.32/0.044/3.96）。闲时减半，节假日另有安排；这里不计节假日，也不是发票金额。
 
 ---
 
@@ -278,11 +293,13 @@ npm run service:status
 ### Docker compose
 
 #### 第一步：下载构建docker-compose.yml文件的脚本并执行
+
 ```bash
 curl -fsSL https://pincc.ai/crs-compose.sh -o crs-compose.sh && chmod +x crs-compose.sh && ./crs-compose.sh
 ```
 
 #### 第二步：启动
+
 ```bash
 docker-compose up -d
 ```
@@ -405,7 +422,6 @@ docker-compose.yml 已包含：
 
 **Claude Code 设置环境变量：**
 
-
 **使用标准 Claude 账号池**
 
 默认使用标准 Claude 账号池：
@@ -439,7 +455,7 @@ claude
 
 ```json
 {
-    "primaryApiKey": "crs"
+  "primaryApiKey": "crs"
 }
 ```
 
@@ -458,11 +474,10 @@ GOOGLE_GENAI_USE_GCA="true"
 GEMINI_MODEL="gemini-2.5-pro" # 如果你有gemini3权限可以填： gemini-3-pro-preview
 ```
 
-> **认证**：只能选 ```Login with Google``` 进行认证，如果跳 Google请删除 ```~/.gemini/settings.json``` 后再尝试启动```gemini```。  
-> **注意**：gemini-cli 控制台会提示 `Failed to fetch user info: 401 Unauthorized`，但使用不受任何影响。  
+> **认证**：只能选 `Login with Google` 进行认证，如果跳 Google请删除 `~/.gemini/settings.json` 后再尝试启动`gemini`。  
+> **注意**：gemini-cli 控制台会提示 `Failed to fetch user info: 401 Unauthorized`，但使用不受任何影响。
 
 **方式二：通过 Gemini API 方式访问**
-
 
 ```bash
 GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:3000/gemini"  # 根据实际填写你服务器的ip地址或者域名
@@ -470,7 +485,7 @@ GEMINI_API_KEY="后台创建的API密钥"
 GEMINI_MODEL="gemini-2.5-pro" # 如果你有gemini3权限可以填： gemini-3-pro-preview
 ```
 
-> **认证**：只能选 ```Use Gemini API Key``` 进行认证，如果提示 ```Enter Gemini API Key``` 请直接留空按回车。如果一打开就跳 Google请删除 ```~/.gemini/settings.json``` 后再尝试启动```gemini```。
+> **认证**：只能选 `Use Gemini API Key` 进行认证，如果提示 `Enter Gemini API Key` 请直接留空按回车。如果一打开就跳 Google请删除 `~/.gemini/settings.json` 后再尝试启动`gemini`。
 
 > 💡 **进阶用法**：想在 Claude Code 中直接使用 Gemini 3 模型？请参考 [Claude Code 调用 Gemini 3 模型指南](docs/claude-code-gemini3-guide/README.md)
 
@@ -508,7 +523,7 @@ requires_openai_auth = true
 
 ```json
 {
-    "OPENAI_API_KEY": "后台创建的API密钥"  
+  "OPENAI_API_KEY": "后台创建的API密钥"
 }
 ```
 
@@ -557,7 +572,7 @@ Droid CLI 读取 `~/.factory/config.json`。可以在该文件中添加自定义
 }
 ```
 
-> 💡 将示例中的 `http://127.0.0.1:3000` 替换为你的服务域名或公网地址，并写入后台生成的 API 密钥（cr_ 开头）。
+> 💡 将示例中的 `http://127.0.0.1:3000` 替换为你的服务域名或公网地址，并写入后台生成的 API 密钥（cr\_ 开头）。
 
 ### 5. 第三方工具API接入
 
@@ -579,9 +594,10 @@ claude-opus-4-20250514     # Claude Opus 4
 ```
 
 配置步骤：
+
 - 供应商类型选择"Anthropic"
 - API地址填入：`http://你的服务器:3000/claude`
-- API Key填入：后台创建的API密钥（cr_开头）
+- API Key填入：后台创建的API密钥（cr\_开头）
 
 **2. Gemini账号接入：**
 
@@ -594,9 +610,10 @@ gemini-2.5-pro             # Gemini 2.5 Pro
 ```
 
 配置步骤：
+
 - 供应商类型选择"Gemini"
 - API地址填入：`http://你的服务器:3000/gemini`
-- API Key填入：后台创建的API密钥（cr_开头）
+- API Key填入：后台创建的API密钥（cr\_开头）
 
 **3. Codex接入：**
 
@@ -609,11 +626,11 @@ gpt-5                      # Codex使用固定模型ID
 ```
 
 配置步骤：
+
 - 供应商类型选择"Openai-Response"
 - API地址填入：`http://你的服务器:3000/openai`
-- API Key填入：后台创建的API密钥（cr_开头）
+- API Key填入：后台创建的API密钥（cr\_开头）
 - **重要**：Codex只支持Openai-Response标准
-
 
 **Cherry Studio 地址格式重要说明：**
 
@@ -725,7 +742,6 @@ npm run service:status
    - 系统会在日志中记录所有请求的User-Agent
    - 客户端验证失败时会返回403错误并记录详细信息
    - 通过日志可以查看实际的User-Agent格式，方便配置自定义客户端
-
 
 ### 日志示例
 
@@ -857,10 +873,10 @@ module.exports = {
 
 **Caddy 特点**
 
-* 🔒 自动 HTTPS，零配置证书管理
-* 🛡️ 安全默认配置，启用现代 TLS 套件
-* ⚡ HTTP/2 和流式传输支持
-* 🔧 配置文件简洁，易于维护
+- 🔒 自动 HTTPS，零配置证书管理
+- 🛡️ 安全默认配置，启用现代 TLS 套件
+- ⚡ HTTP/2 和流式传输支持
+- 🔧 配置文件简洁，易于维护
 
 ---
 
@@ -872,18 +888,19 @@ Nginx Proxy Manager 通过图形化界面管理反向代理和 HTTPS 证书，�
 
 Details 配置如下：
 
-| 项目                    | 设置                      |
-| --------------------- | ----------------------- |
-| Domain Names          | relay.example.com       |
-| Scheme                | http                    |
+| 项目                  | 设置                         |
+| --------------------- | ---------------------------- |
+| Domain Names          | relay.example.com            |
+| Scheme                | http                         |
 | Forward Hostname / IP | 192.168.0.1 (docker 机器 IP) |
-| Forward Port          | 3000                    |
-| Block Common Exploits | ☑️                      |
-| Websockets Support    | ❌ **关闭**                |
-| Cache Assets          | ❌ **关闭**                |
-| Access List           | Publicly Accessible     |
+| Forward Port          | 3000                         |
+| Block Common Exploits | ☑️                           |
+| Websockets Support    | ❌ **关闭**                  |
+| Cache Assets          | ❌ **关闭**                  |
+| Access List           | Publicly Accessible          |
 
 > 注意：
+>
 > - 请确保 Claude Relay Service **监听 host 为 `0.0.0.0` 、容器 IP 或本机 IP**，以便 NPM 实现内网连接。
 > - **Websockets Support 和 Cache Assets 必须关闭**，否则会导致 SSE / 流式响应失败。
 
@@ -893,11 +910,11 @@ Details 配置如下：
 
 **3. SSL 设置**
 
-* **SSL Certificate**: Request a new SSL Certificate (Let's Encrypt) 或已有证书
-* ☑️ **Force SSL**
-* ☑️ **HTTP/2 Support**
-* ☑️ **HSTS Enabled**
-* ☑️ **HSTS Subdomains**
+- **SSL Certificate**: Request a new SSL Certificate (Let's Encrypt) 或已有证书
+- ☑️ **Force SSL**
+- ☑️ **HTTP/2 Support**
+- ☑️ **HSTS Enabled**
+- ☑️ **HSTS Subdomains**
 
 **4. Advanced 配置**
 
@@ -944,16 +961,16 @@ proxy_request_buffering off;
 
 **4. 启动和验证**
 
-* 保存后等待 NPM 自动申请 Let's Encrypt 证书（如果有）。
-* Dashboard 中查看 Proxy Host 状态，确保显示为 "Online"。
-* 访问 `https://relay.example.com`，如果显示绿色锁图标即表示 HTTPS 正常。
+- 保存后等待 NPM 自动申请 Let's Encrypt 证书（如果有）。
+- Dashboard 中查看 Proxy Host 状态，确保显示为 "Online"。
+- 访问 `https://relay.example.com`，如果显示绿色锁图标即表示 HTTPS 正常。
 
 **NPM 特点**
 
-* 🔒 自动申请和续期证书
-* 🔧 图形化界面，方便管理多服务
-* ⚡ 原生支持 HTTP/2 / HTTPS
-* 🚀 适合 Docker 容器部署
+- 🔒 自动申请和续期证书
+- 🔧 图形化界面，方便管理多服务
+- ⚡ 原生支持 HTTP/2 / HTTPS
+- 🚀 适合 Docker 容器部署
 
 ---
 

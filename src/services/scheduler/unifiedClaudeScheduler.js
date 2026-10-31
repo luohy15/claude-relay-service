@@ -10,6 +10,7 @@ const {
   isOpus45OrNewer,
   getRateLimitModelFamily
 } = require('../../utils/modelHelper')
+const deepseekProvider = require('../deepseekProvider')
 const { isSchedulable, sortAccountsByPriority } = require('../../utils/commonHelper')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
 const config = require('../../../config/config')
@@ -194,6 +195,13 @@ class UnifiedClaudeScheduler {
           )
           // 不使用 forcedAccount，继续走下面的正常调度逻辑
         } else {
+          if (deepseekProvider.isNativeDeepSeekId(requestedModel)) {
+            const error = new Error('Session binding account unavailable for requested provider')
+            error.code = 'SESSION_BINDING_ACCOUNT_UNAVAILABLE'
+            error.accountId = forcedAccount.accountId
+            error.accountType = forcedAccount.accountType
+            throw error
+          }
           // claude-official 类型需要检查可用性并强制使用
           logger.info(
             `🔗 Forced session binding detected: ${forcedAccount.accountId} (${forcedAccount.accountType})`
@@ -241,6 +249,25 @@ class UnifiedClaudeScheduler {
       if (vendor === 'ccr') {
         logger.info(`🎯 CCR vendor prefix detected, routing to CCR accounts only`)
         return await this._selectCcrAccount(apiKeyData, sessionHash, effectiveModel)
+      }
+
+      if (deepseekProvider.isNativeDeepSeekId(effectiveModel)) {
+        const deepseekCanonical = deepseekProvider.canonicalDeepSeekModel(effectiveModel)
+        if (!deepseekCanonical) {
+          const error = new Error(
+            `Unsupported DeepSeek model: ${deepseekProvider.stripCapabilitySuffix(effectiveModel)}`
+          )
+          error.code = 'DEEPSEEK_MODEL_UNSUPPORTED'
+          error.httpStatus = 400
+          error.errorPayload = {
+            error: {
+              type: 'invalid_request_error',
+              message: error.message
+            }
+          }
+          throw error
+        }
+        return await this._selectDeepSeekAccount(apiKeyData, sessionHash, deepseekCanonical)
       }
       // 如果API Key绑定了专属账户或分组，优先使用
       if (apiKeyData.claudeAccountId) {
@@ -359,7 +386,11 @@ class UnifiedClaudeScheduler {
         const boundConsoleAccount = await claudeConsoleAccountService.getAccount(
           apiKeyData.claudeConsoleAccountId
         )
-        if (
+        if (boundConsoleAccount && boundConsoleAccount.provider === 'deepseek') {
+          logger.info(
+            `ℹ️ Skipping DeepSeek console account ${boundConsoleAccount.id} for a non-DeepSeek request`
+          )
+        } else if (
           boundConsoleAccount &&
           boundConsoleAccount.isActive === true &&
           boundConsoleAccount.status === 'active' &&
@@ -587,7 +618,11 @@ class UnifiedClaudeScheduler {
       const boundConsoleAccount = await claudeConsoleAccountService.getAccount(
         apiKeyData.claudeConsoleAccountId
       )
-      if (
+      if (boundConsoleAccount && boundConsoleAccount.provider === 'deepseek') {
+        logger.info(
+          `ℹ️ Skipping bound DeepSeek console account ${boundConsoleAccount.id} while selecting a non-DeepSeek pool`
+        )
+      } else if (
         boundConsoleAccount &&
         boundConsoleAccount.isActive === true &&
         boundConsoleAccount.status === 'active' &&
@@ -774,6 +809,10 @@ class UnifiedClaudeScheduler {
             logger.info(`✅ Account ${currentAccount.name} recovered from quota_exceeded status`)
           }
         }
+      }
+
+      if (currentAccount.provider === 'deepseek') {
+        continue
       }
 
       logger.info(
@@ -1046,6 +1085,11 @@ class UnifiedClaudeScheduler {
   // 🔍 检查账户是否可用
   async _isAccountAvailable(accountId, accountType, requestedModel = null) {
     try {
+      const wantsDeepSeek = deepseekProvider.isNativeDeepSeekId(requestedModel)
+      if (wantsDeepSeek && accountType !== 'claude-console') {
+        return false
+      }
+
       if (accountType === 'claude-official') {
         const account = await redis.getClaudeAccount(accountId)
         if (
@@ -1104,6 +1148,12 @@ class UnifiedClaudeScheduler {
       } else if (accountType === 'claude-console') {
         const account = await claudeConsoleAccountService.getAccount(accountId)
         if (!account || !account.isActive) {
+          return false
+        }
+        if (wantsDeepSeek && account.provider !== 'deepseek') {
+          return false
+        }
+        if (!wantsDeepSeek && account.provider === 'deepseek') {
           return false
         }
         // 检查账户状态
@@ -1525,12 +1575,164 @@ class UnifiedClaudeScheduler {
     }
   }
 
+  async _deepSeekAccountUsable(account, canonicalModel) {
+    if (!account || account.provider !== 'deepseek') {
+      return false
+    }
+    if (account.isActive !== true || account.status !== 'active') {
+      return false
+    }
+    if (!isSchedulable(account.schedulable)) {
+      return false
+    }
+    if (!this._isModelSupportedByAccount(account, 'claude-console', canonicalModel)) {
+      return false
+    }
+    if (
+      typeof claudeConsoleAccountService.isSubscriptionExpired === 'function' &&
+      claudeConsoleAccountService.isSubscriptionExpired(account)
+    ) {
+      return false
+    }
+    if (await this.isAccountTemporarilyUnavailable(account.id, 'claude-console')) {
+      return false
+    }
+    if (await claudeConsoleAccountService.isAccountRateLimited(account.id)) {
+      return false
+    }
+    if (await claudeConsoleAccountService.isAccountQuotaExceeded(account.id)) {
+      return false
+    }
+    if (account.maxConcurrentTasks > 0) {
+      const currentConcurrency = await redis.getConsoleAccountConcurrency(account.id)
+      if (currentConcurrency >= account.maxConcurrentTasks) {
+        return false
+      }
+    }
+    return true
+  }
+
+  // DeepSeek 请求只在 provider=deepseek 的 Console 账户中选择，失败也不回退到其它平台。
+  async _selectDeepSeekAccount(apiKeyData, sessionHash, canonicalModel) {
+    if (
+      apiKeyData.claudeConsoleAccountId &&
+      !String(apiKeyData.claudeAccountId || '').startsWith('group:')
+    ) {
+      const bound = await claudeConsoleAccountService.getAccount(apiKeyData.claudeConsoleAccountId)
+      if (bound && bound.provider === 'deepseek') {
+        if (await this._deepSeekAccountUsable(bound, canonicalModel)) {
+          return { accountId: bound.id, accountType: 'claude-console' }
+        }
+        logger.warn(
+          `⚠️ Bound DeepSeek account ${bound.id} is unavailable; staying inside the DeepSeek pool`
+        )
+      } else {
+        logger.info(
+          `ℹ️ Ignoring non-DeepSeek dedicated binding ${apiKeyData.claudeConsoleAccountId} for ${canonicalModel}`
+        )
+      }
+    }
+
+    if (
+      typeof apiKeyData.claudeAccountId === 'string' &&
+      apiKeyData.claudeAccountId.startsWith('group:')
+    ) {
+      const groupId = apiKeyData.claudeAccountId.replace('group:', '')
+      return await this.selectAccountFromGroup(
+        groupId,
+        sessionHash,
+        canonicalModel,
+        false,
+        'deepseek'
+      )
+    }
+
+    if (sessionHash) {
+      const mappedAccount = await this._getSessionMapping(sessionHash)
+      if (mappedAccount) {
+        const mapped =
+          mappedAccount.accountType === 'claude-console'
+            ? await claudeConsoleAccountService.getAccount(mappedAccount.accountId)
+            : null
+        if (await this._deepSeekAccountUsable(mapped, canonicalModel)) {
+          await this._extendSessionMappingTTL(sessionHash)
+          return {
+            accountId: mapped.id,
+            accountType: 'claude-console'
+          }
+        }
+        await this._deleteSessionMapping(sessionHash)
+      }
+    }
+
+    const accounts = await claudeConsoleAccountService.getAllAccounts()
+    const usable = []
+    let concurrencyExcluded = 0
+    let eligible = 0
+    for (const account of accounts) {
+      if (account.provider !== 'deepseek' || account.accountType !== 'shared') {
+        continue
+      }
+      if (
+        account.isActive !== true ||
+        account.status !== 'active' ||
+        !isSchedulable(account.schedulable)
+      ) {
+        continue
+      }
+      if (!this._isModelSupportedByAccount(account, 'claude-console', canonicalModel)) {
+        continue
+      }
+      if (claudeConsoleAccountService.isSubscriptionExpired(account)) {
+        continue
+      }
+      if (await claudeConsoleAccountService.isAccountRateLimited(account.id)) {
+        continue
+      }
+      if (await claudeConsoleAccountService.isAccountQuotaExceeded(account.id)) {
+        continue
+      }
+      if (await this.isAccountTemporarilyUnavailable(account.id, 'claude-console')) {
+        continue
+      }
+      eligible += 1
+      if (account.maxConcurrentTasks > 0) {
+        const currentConcurrency = await redis.getConsoleAccountConcurrency(account.id)
+        if (currentConcurrency >= account.maxConcurrentTasks) {
+          concurrencyExcluded += 1
+          continue
+        }
+      }
+      usable.push(account)
+    }
+
+    if (usable.length === 0) {
+      if (eligible > 0 && concurrencyExcluded === eligible) {
+        const error = new Error(
+          'All available Claude Console accounts have reached their concurrency limit'
+        )
+        error.code = 'CONSOLE_ACCOUNT_CONCURRENCY_FULL'
+        throw error
+      }
+      const error = new Error(`No available DeepSeek accounts support model: ${canonicalModel}`)
+      error.code = 'NO_DEEPSEEK_ACCOUNT'
+      throw error
+    }
+
+    const selected = sortAccountsByPriority(usable)[0]
+    if (sessionHash) {
+      await this._setSessionMapping(sessionHash, selected.id, 'claude-console')
+    }
+    return { accountId: selected.id, accountType: 'claude-console' }
+  }
+
   // 👥 从分组中选择账户
   async selectAccountFromGroup(
     groupId,
     sessionHash = null,
     requestedModel = null,
-    allowCcr = false
+    allowCcr = false,
+    providerScope = null
   ) {
     try {
       // 获取分组信息
@@ -1619,6 +1821,20 @@ class UnifiedClaudeScheduler {
           continue
         }
 
+        const memberIsDeepSeek = account.provider === 'deepseek'
+        if (
+          providerScope === 'deepseek' &&
+          (accountType !== 'claude-console' || !memberIsDeepSeek)
+        ) {
+          continue
+        }
+        if (providerScope !== 'deepseek' && memberIsDeepSeek) {
+          continue
+        }
+        if (memberIsDeepSeek && claudeConsoleAccountService.isSubscriptionExpired(account)) {
+          continue
+        }
+
         // 检查账户是否可用
         const isActive =
           accountType === 'claude-official'
@@ -1660,6 +1876,14 @@ class UnifiedClaudeScheduler {
               )
               continue
             }
+          }
+
+          if (
+            accountType === 'claude-console' &&
+            account.provider === 'deepseek' &&
+            (await claudeConsoleAccountService.isAccountQuotaExceeded(account.id))
+          ) {
+            continue
           }
 
           // 🔒 检查 Claude Console 账户的并发限制

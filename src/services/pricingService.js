@@ -4,6 +4,7 @@ const https = require('https')
 const crypto = require('crypto')
 const pricingSource = require('../../config/pricingSource')
 const logger = require('../utils/logger')
+const deepseekProvider = require('./deepseekProvider')
 
 class PricingService {
   constructor() {
@@ -395,6 +396,14 @@ class PricingService {
       return this.localOverrides[modelName]
     }
 
+    if (!String(modelName).includes('/')) {
+      const canonical = deepseekProvider.canonicalDeepSeekModel(modelName)
+      const directPricing = canonical ? deepseekProvider.peakPricing(canonical) : null
+      if (directPricing) {
+        return directPricing
+      }
+    }
+
     if (!this.pricingData) {
       return null
     }
@@ -436,10 +445,19 @@ class PricingService {
       }
     }
 
+    // 未收录的直连 deepseek-* 不做模糊匹配，避免落到已停用的 chat/reasoner 价格。
+    if (deepseekProvider.isUnqualifiedUnknownDeepSeek(modelName)) {
+      logger.debug(`💰 No direct DeepSeek pricing for unknown model: ${modelName}`)
+      return null
+    }
+
     // 尝试模糊匹配（处理版本号等变化）
     const normalizedModel = modelName.toLowerCase().replace(/[_-]/g, '')
 
     for (const [key, value] of Object.entries(this.pricingData)) {
+      if (String(modelName).includes('/') && deepseekProvider.canonicalDeepSeekModel(key)) {
+        continue
+      }
       const normalizedKey = key.toLowerCase().replace(/[_-]/g, '')
       if (normalizedKey.includes(normalizedModel) || normalizedModel.includes(normalizedKey)) {
         logger.debug(`💰 Found pricing for ${modelName} using fuzzy match: ${key}`)

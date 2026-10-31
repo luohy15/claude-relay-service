@@ -29,6 +29,7 @@ const { sanitizeUpstreamError } = require('../utils/errorSanitizer')
 const { dumpAnthropicMessagesRequest } = require('../utils/anthropicRequestDump')
 const { createRequestDetailMeta } = require('../utils/requestDetailHelper')
 const { attachHeartbeat } = require('../utils/sseHeartbeat')
+const deepseekProvider = require('../services/deepseekProvider')
 const {
   handleAnthropicMessagesToGemini,
   handleAnthropicCountTokensToGemini
@@ -40,6 +41,13 @@ const {
   stripBridgeReasoningBlocks
 } = require('../services/anthropicToResponses')
 const router = express.Router()
+
+function billingModelName(model) {
+  if (!model || String(model).includes('/')) {
+    return model
+  }
+  return deepseekProvider.canonicalDeepSeekModel(model) || model
+}
 
 function queueRateLimitUpdate(
   rateLimitInfo,
@@ -173,6 +181,18 @@ async function handleMessagesRequest(req, res) {
     // 客户端能力后缀（gpt-5.6-sol[1m]）只是 Claude Code 侧的上下文预算声明，路由与模型黑名单
     // 一律用剥掉后缀的真实模型；不带后缀的模型 id 逐字节相同，原有分流零变化。
     const upstreamModel = stripModelCapabilitySuffix(req.body?.model)
+    if (deepseekProvider.isNativeDeepSeekId(upstreamModel)) {
+      const deepseekCanonical = deepseekProvider.canonicalDeepSeekModel(upstreamModel)
+      if (!deepseekCanonical) {
+        return res.status(400).json({
+          error: {
+            type: 'invalid_request_error',
+            message: `Unsupported DeepSeek model: ${upstreamModel}`
+          }
+        })
+      }
+      req._deepseekCanonicalModel = deepseekCanonical
+    }
     const modelVendor = req.baseUrl === '/api' ? resolveVendorFromModel(upstreamModel) : null
     const forcedVendor = req._anthropicVendor || modelVendor
     const requiredService =
@@ -181,10 +201,66 @@ async function handleMessagesRequest(req, res) {
     // 🛣️ /api 挂载点：非原生前缀（claude-/gemini-/gpt-）的模型走 openai-responses(OpenRouter) 后端，
     // 让 Anthropic-Messages 流量的 per-model usage 落到 user-model-stats；原生 claude 模型零回归。
     // 必须在 Claude 权限校验之前：OpenRouter 的 cr_ key 只有 openai 权限，否则会被 403。
-    if (req.baseUrl === '/api' && !forcedVendor && !isNativeModelPrefix(upstreamModel)) {
+    if (
+      req.baseUrl === '/api' &&
+      !forcedVendor &&
+      !isNativeModelPrefix(upstreamModel) &&
+      !deepseekProvider.isNativeDeepSeekId(upstreamModel)
+    ) {
       req._fromUnifiedEndpoint = true
       // transcript 从 grok/codex 桥接切到 OpenRouter 时，桥接写入的 redacted_thinking 对方无法解密（todo 3733）
       stripBridgeReasoningBlocks(req.body)
+      const officialModel = deepseekProvider.officialFirstModel(upstreamModel)
+      if (officialModel) {
+        if (
+          [req.body.model, upstreamModel, officialModel].some((model) =>
+            isModelRestricted(req.apiKey, model)
+          )
+        ) {
+          return res.status(403).json(buildErrorEnvelope(403, { message: '暂无该模型访问权限' }))
+        }
+        if (
+          apiKeyService.hasPermission(req.apiKey?.permissions, 'claude') &&
+          !deepseekProvider.findUnsupportedRequest(req.body)
+        ) {
+          const deadline = Date.now() + (req.body.stream ? 75000 : 180000)
+          for (let attempt = 1; attempt <= 2; attempt++) {
+            if (res.destroyed || res.writableEnded || req.aborted) {
+              return
+            }
+            const remaining = deadline - Date.now()
+            if (remaining <= 0) {
+              break
+            }
+            const officialReq = Object.create(req)
+            officialReq.body = { ...req.body, model: officialModel }
+            officialReq._deepseekAttempt = { officialFirst: true, timeoutMs: remaining, deadline }
+            logger.info(`DeepSeek route=official attempt=${attempt}`)
+            const result = await handleMessagesRequest(officialReq, res)
+            if (
+              !result?.fallback ||
+              res.headersSent ||
+              res.destroyed ||
+              res.writableEnded ||
+              req.aborted
+            ) {
+              return result
+            }
+            logger.info(
+              `DeepSeek route=fallback reason=${result.statusCode || 'no-account'} attempt=${attempt}`
+            )
+            if (result.noAccount || attempt === 2) {
+              break
+            }
+            if (Date.now() + result.retryAfterMs >= deadline) {
+              break
+            }
+            await new Promise((resolve) => setTimeout(resolve, result.retryAfterMs))
+          }
+        } else {
+          logger.info('DeepSeek route=openrouter reason=ineligible')
+        }
+      }
       const openaiRoutes = require('./openaiRoutes') // lazy require, avoid app.js circular load
       return await openaiRoutes.handleResponses(req, res)
     }
@@ -239,8 +315,11 @@ async function handleMessagesRequest(req, res) {
       })
     }
 
-    // transcript 从 grok 桥接切到原生 Claude 时，桥接写入的 redacted_thinking 原生上游无法解密
-    const strippedReasoningBlocks = stripBridgeReasoningBlocks(req.body)
+    // transcript 从 grok 桥接切到原生 Claude 时，桥接写入的 redacted_thinking 原生上游无法解密。
+    // DeepSeek 不接收这些块，但必须显式 400，不能在进转发前静默删掉。
+    const strippedReasoningBlocks = req._deepseekCanonicalModel
+      ? 0
+      : stripBridgeReasoningBlocks(req.body)
     if (strippedReasoningBlocks > 0) {
       logger.info(
         `🧹 Stripped ${strippedReasoningBlocks} bridge reasoning block(s) for native Claude`
@@ -248,7 +327,12 @@ async function handleMessagesRequest(req, res) {
     }
 
     // 模型限制（黑名单）校验：统一在此处处理（去除供应商前缀）
-    if (isModelRestricted(req.apiKey, req.body.model)) {
+    const restrictionCandidates = [
+      req.body.model,
+      upstreamModel,
+      req._deepseekCanonicalModel
+    ].filter(Boolean)
+    if (restrictionCandidates.some((model) => isModelRestricted(req.apiKey, model))) {
       return res.status(403).json({
         error: {
           type: 'forbidden',
@@ -347,11 +431,15 @@ async function handleMessagesRequest(req, res) {
       // 只启动定时器、不主动 flush 头部，保持 fast-path 上错误状态码/重试逻辑（依赖 headersSent=false）
       // 不变；若 pre-200 阶段真的静默 >15s，心跳才会写出首字节并提交头部。句柄传入各 relay，
       // 由已有的 post-200 markData()/stop() 接管，避免重复启动第二个定时器。
-      const streamHeartbeat = attachHeartbeat(res, {
-        logger,
-        label: `Preflight:${req.apiKey?.name || 'unknown'}`
-      })
-      res.once('close', () => streamHeartbeat.stop())
+      const streamHeartbeat = req._deepseekAttempt
+        ? null
+        : attachHeartbeat(res, {
+            logger,
+            label: `Preflight:${req.apiKey?.name || 'unknown'}`
+          })
+      if (streamHeartbeat) {
+        res.once('close', () => streamHeartbeat.stop())
+      }
 
       let usageDataCaptured = false
 
@@ -639,7 +727,7 @@ async function handleMessagesRequest(req, res) {
         const _apiKeyConsole = req.apiKey
         const _headersConsole = req.headers
 
-        await claudeConsoleRelayService.relayStreamRequestWithUsageCapture(
+        const attemptResult = await claudeConsoleRelayService.relayStreamRequestWithUsageCapture(
           _requestBodyConsole,
           _apiKeyConsole,
           res,
@@ -671,7 +759,9 @@ async function handleMessagesRequest(req, res) {
               }
 
               const cacheReadTokens = usageData.cache_read_input_tokens || 0
-              const model = usageData.model || 'unknown'
+              const model = billingModelName(
+                usageData.model || _requestBodyConsole.model || 'unknown'
+              )
 
               // 记录真实的token使用量（包含模型信息和所有4种token以及账户ID）
               const usageAccountId = usageData.accountId
@@ -767,8 +857,11 @@ async function handleMessagesRequest(req, res) {
           },
           accountId,
           null,
-          { heartbeat: streamHeartbeat }
+          { heartbeat: streamHeartbeat, ...req._deepseekAttempt }
         )
+        if (attemptResult?.fallback) {
+          return attemptResult
+        }
       } else if (accountType === 'bedrock') {
         // Bedrock账号使用Bedrock转发服务
         // 🧹 内存优化：提取需要的值
@@ -1229,8 +1322,12 @@ async function handleMessagesRequest(req, res) {
           req, // clientRequest 保留用于断开检测
           res,
           _headersNonStream,
-          accountId
+          accountId,
+          req._deepseekAttempt || {}
         )
+        if (response?.fallback) {
+          return response
+        }
       } else if (accountType === 'bedrock') {
         // Bedrock账号使用Bedrock转发服务
         try {
@@ -1337,7 +1434,7 @@ async function handleMessagesRequest(req, res) {
           // Parse the model to remove vendor prefix if present (e.g., "ccr,gemini-2.5-pro" -> "gemini-2.5-pro")
           const rawModel = jsonData.model || _requestBodyNonStream.model || 'unknown'
           const { baseModel: usageBaseModel } = parseVendorPrefixedModel(rawModel)
-          const model = usageBaseModel || rawModel
+          const model = billingModelName(usageBaseModel || rawModel)
 
           // 构建 usage 对象以传递给 recordUsageWithDetails
           const usageObject = {
@@ -1432,7 +1529,25 @@ async function handleMessagesRequest(req, res) {
     logger.api(`✅ Request completed in ${duration}ms for key: ${req.apiKey.name}`)
     return undefined
   } catch (error) {
+    if (
+      req._deepseekAttempt &&
+      !res.headersSent &&
+      ['NO_DEEPSEEK_ACCOUNT', 'CONSOLE_ACCOUNT_CONCURRENCY_FULL'].includes(error.code)
+    ) {
+      return { fallback: true, noAccount: true }
+    }
     let handledError = error
+
+    if (handledError.httpStatus && !res.headersSent) {
+      return res.status(handledError.httpStatus).json(
+        handledError.errorPayload || {
+          error: {
+            type: 'invalid_request_error',
+            message: handledError.message
+          }
+        }
+      )
+    }
 
     // 🔄 并发满额降级处理：捕获CONSOLE_ACCOUNT_CONCURRENCY_FULL错误
     if (
@@ -1751,10 +1866,19 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
   // 按路径强制分流（避免 model 前缀混乱）：gemini-cli/antigravity → Gemini OAuth，codex/grok → Responses 桥接。
   // 统一 /api 挂载点上再按模型 id 前缀补上 codex/grok，否则 Claude Code 每轮都会调用的这个端点
   // 会用 requiredService='claude' 403 掉只有 openai 权限的 key（同 handleMessagesRequest 的分流逻辑）。
-  const modelVendor =
-    req.baseUrl === '/api'
-      ? resolveVendorFromModel(stripModelCapabilitySuffix(req.body?.model))
-      : null
+  const countTokensModel = stripModelCapabilitySuffix(req.body?.model)
+  if (
+    deepseekProvider.isNativeDeepSeekId(countTokensModel) &&
+    !deepseekProvider.canonicalDeepSeekModel(countTokensModel)
+  ) {
+    return res.status(400).json({
+      error: {
+        type: 'invalid_request_error',
+        message: `Unsupported DeepSeek model: ${countTokensModel}`
+      }
+    })
+  }
+  const modelVendor = req.baseUrl === '/api' ? resolveVendorFromModel(countTokensModel) : null
   const forcedVendor = req._anthropicVendor || modelVendor
   const permissionMessages = {
     gemini: 'This API key does not have permission to access Gemini',
@@ -1786,7 +1910,9 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
     return res.status(200).json({ input_tokens: estimateInputTokens(req.body) })
   }
 
-  stripBridgeReasoningBlocks(req.body)
+  if (!deepseekProvider.canonicalDeepSeekModel(countTokensModel)) {
+    stripBridgeReasoningBlocks(req.body)
+  }
 
   // 🔗 会话绑定验证（与 messages 端点保持一致）
   const originalSessionId = claudeRelayConfigService.extractOriginalSessionId(req.body)
