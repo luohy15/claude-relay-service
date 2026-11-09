@@ -24,9 +24,21 @@ const claudeConsoleRelayService = require('../src/services/relay/claudeConsoleRe
 const claudeConsoleAccountService = require('../src/services/account/claudeConsoleAccountService')
 const { createClaudeTestPayload, sendStreamTestRequest } = require('../src/utils/testPayloadHelper')
 
+const originalDisableFlag = process.env.DISABLE_ANTHROPIC_MODELS
+
 describe('claudeConsoleRelayService.testAccountConnection', () => {
   beforeEach(() => {
     jest.clearAllMocks()
+    // 这两个用例测的是开关关闭后的请求形状。默认开关是开的，会在发请求前拦住。
+    process.env.DISABLE_ANTHROPIC_MODELS = 'false'
+  })
+
+  afterEach(() => {
+    if (originalDisableFlag === undefined) {
+      delete process.env.DISABLE_ANTHROPIC_MODELS
+    } else {
+      process.env.DISABLE_ANTHROPIC_MODELS = originalDisableFlag
+    }
   })
 
   it('passes selected model stream payload and bearer auth for non sk-ant key', async () => {
@@ -89,5 +101,27 @@ describe('claudeConsoleRelayService.testAccountConnection', () => {
       })
     )
     expect(requestOptions).not.toHaveProperty('authorization')
+  })
+
+  it('does not call upstream when the disable flag is on', async () => {
+    delete process.env.DISABLE_ANTHROPIC_MODELS
+    const chunks = []
+    const res = {
+      headersSent: false,
+      writeHead: jest.fn(),
+      write: jest.fn((chunk) => {
+        chunks.push(chunk)
+        return true
+      }),
+      end: jest.fn()
+    }
+
+    await claudeConsoleRelayService.testAccountConnection('a1', res, 'claude-sonnet-4-6')
+
+    expect(createClaudeTestPayload).not.toHaveBeenCalled()
+    expect(sendStreamTestRequest).not.toHaveBeenCalled()
+    expect(claudeConsoleAccountService.getAccount).not.toHaveBeenCalled()
+    expect(chunks.join('')).toContain('disabled')
+    expect(res.end).toHaveBeenCalled()
   })
 })
