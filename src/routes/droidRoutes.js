@@ -5,6 +5,8 @@ const droidRelayService = require('../services/relay/droidRelayService')
 const sessionHelper = require('../utils/sessionHelper')
 const logger = require('../utils/logger')
 const apiKeyService = require('../services/apiKeyService')
+const { isAnthropicModel } = require('../utils/modelHelper')
+const { areAnthropicModelsDisabled } = require('../middleware/anthropicModelGuard')
 
 const router = express.Router()
 
@@ -159,7 +161,7 @@ router.post(['/openai/v1/responses', '/openai/responses'], authenticateApiKey, a
 router.get('/*/v1/models', authenticateApiKey, async (req, res) => {
   try {
     // 返回可用的模型列表
-    const models = [
+    let models = [
       {
         id: 'claude-opus-4-1-20250805',
         object: 'model',
@@ -179,6 +181,10 @@ router.get('/*/v1/models', authenticateApiKey, async (req, res) => {
         owned_by: 'openai'
       }
     ]
+
+    if (areAnthropicModelsDisabled()) {
+      models = models.filter((model) => !isAnthropicModel(model.id))
+    }
 
     res.json({
       object: 'list',

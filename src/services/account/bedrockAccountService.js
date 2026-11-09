@@ -6,6 +6,12 @@ const config = require('../../../config/config')
 const bedrockRelayService = require('../relay/bedrockRelayService')
 const LRUCache = require('../../utils/lruCache')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const { isAnthropicModel } = require('../../utils/modelHelper')
+const {
+  areAnthropicModelsDisabled,
+  ANTHROPIC_MODELS_DISABLED_MESSAGE,
+  writeDisabledTestStream
+} = require('../../middleware/anthropicModelGuard')
 
 class BedrockAccountService {
   constructor() {
@@ -527,6 +533,16 @@ class BedrockAccountService {
    */
   async testAccountConnection(accountId, res, model = null) {
     const { InvokeModelWithResponseStreamCommand } = require('@aws-sdk/client-bedrock-runtime')
+
+    // 这个测试固定发送 Anthropic Messages payload，开关打开时整段不打 Bedrock。
+    const testedModel = model || 'us.anthropic.claude-3-5-haiku-20241022-v1:0'
+    if (areAnthropicModelsDisabled()) {
+      logger.warn(
+        `⏭️ Blocked Bedrock account test for ${testedModel} (anthropic=${isAnthropicModel(testedModel)}): ${ANTHROPIC_MODELS_DISABLED_MESSAGE}`
+      )
+      writeDisabledTestStream(res)
+      return
+    }
 
     try {
       // 获取账户信息

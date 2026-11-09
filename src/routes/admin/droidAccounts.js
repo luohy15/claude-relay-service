@@ -14,6 +14,11 @@ const {
 const webhookNotifier = require('../../utils/webhookNotifier')
 const { formatAccountExpiry, mapExpiryField } = require('./utils')
 const { extractErrorMessage } = require('../../utils/testPayloadHelper')
+const { isAnthropicModel } = require('../../utils/modelHelper')
+const {
+  areAnthropicModelsDisabled,
+  ANTHROPIC_MODELS_DISABLED_BODY
+} = require('../../middleware/anthropicModelGuard')
 
 const router = express.Router()
 
@@ -607,6 +612,10 @@ router.post('/droid-accounts/:accountId/test', authenticateAdmin, async (req, re
   const { accountId } = req.params
   const { model = 'claude-sonnet-4-20250514' } = req.body
   const startTime = Date.now()
+
+  if (areAnthropicModelsDisabled() && isAnthropicModel(model)) {
+    return res.status(403).json(ANTHROPIC_MODELS_DISABLED_BODY)
+  }
 
   try {
     // 获取账户信息

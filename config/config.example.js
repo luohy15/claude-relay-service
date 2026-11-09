@@ -15,7 +15,16 @@ const config = {
     jwtSecret: process.env.JWT_SECRET || 'CHANGE-THIS-JWT-SECRET-IN-PRODUCTION',
     adminSessionTimeout: parseInt(process.env.ADMIN_SESSION_TIMEOUT) || 86400000, // 24小时
     apiKeyPrefix: process.env.API_KEY_PREFIX || 'cr_',
-    encryptionKey: process.env.ENCRYPTION_KEY || 'CHANGE-THIS-32-CHARACTER-KEY-NOW'
+    encryptionKey: process.env.ENCRYPTION_KEY || 'CHANGE-THIS-32-CHARACTER-KEY-NOW',
+    // 拒绝 Claude/Anthropic 模型（含 Bedrock、OpenRouter、opus/sonnet/haiku/fable 别名）。
+    // DISABLE_ANTHROPIC_MODELS=false 后重启即可恢复。未设置时默认禁用。
+    disableAnthropicModels: (() => {
+      const raw = process.env.DISABLE_ANTHROPIC_MODELS
+      if (raw === undefined || String(raw).trim() === '') {
+        return true
+      }
+      return !['false', '0', 'no', 'off'].includes(String(raw).trim().toLowerCase())
+    })()
   },
 
   // 📊 Redis配置

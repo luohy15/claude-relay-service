@@ -15,6 +15,13 @@ const userMessageQueueService = require('../userMessageQueueService')
 const { isStreamWritable } = require('../../utils/streamHelper')
 const { filterForClaude } = require('../../utils/headerFilter')
 const { attachHeartbeat } = require('../../utils/sseHeartbeat')
+const { isAnthropicModel } = require('../../utils/modelHelper')
+const {
+  areAnthropicModelsDisabled,
+  ANTHROPIC_MODELS_DISABLED_BODY,
+  ANTHROPIC_MODELS_DISABLED_MESSAGE,
+  writeDisabledTestStream
+} = require('../../middleware/anthropicModelGuard')
 
 class ClaudeConsoleRelayService {
   constructor() {
@@ -180,6 +187,11 @@ class ClaudeConsoleRelayService {
       }
       if (account.provider === 'deepseek') {
         modifiedRequestBody = deepseekProvider.prepareDeepSeekBody(modifiedRequestBody)
+      }
+
+      const blockedResponse = this._blockedAnthropicResponse(modifiedRequestBody.model, accountId)
+      if (blockedResponse) {
+        return blockedResponse
       }
 
       // 模型兼容性检查已经在调度器中完成，这里不需要再检查
@@ -710,6 +722,17 @@ class ClaudeConsoleRelayService {
       }
       if (account.provider === 'deepseek') {
         modifiedRequestBody = deepseekProvider.prepareDeepSeekBody(modifiedRequestBody)
+      }
+
+      if (this._blockedAnthropicResponse(modifiedRequestBody.model, accountId)) {
+        if (
+          responseStream &&
+          !responseStream.headersSent &&
+          typeof responseStream.status === 'function'
+        ) {
+          responseStream.status(403).json(ANTHROPIC_MODELS_DISABLED_BODY)
+        }
+        return
       }
 
       // 模型兼容性检查已经在调度器中完成，这里不需要再检查
@@ -1749,12 +1772,38 @@ class ClaudeConsoleRelayService {
     }
   }
 
+  // 映射后的上游模型仍是 Claude/Anthropic 或 openrouter/auto 时，不发上游请求。
+  _blockedAnthropicResponse(model, accountId) {
+    if (!areAnthropicModelsDisabled() || !isAnthropicModel(model)) {
+      return null
+    }
+
+    logger.warn(
+      `⛔ Blocked console upstream model ${model} for account ${accountId}: ${ANTHROPIC_MODELS_DISABLED_MESSAGE}`
+    )
+    return {
+      statusCode: 403,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(ANTHROPIC_MODELS_DISABLED_BODY),
+      accountId
+    }
+  }
+
   // 🧪 测试账号连接（供Admin API使用）
   async testAccountConnection(accountId, responseStream, model) {
     const {
       createClaudeTestPayload,
       sendStreamTestRequest
     } = require('../../utils/testPayloadHelper')
+
+    const testedModel = model || 'claude-sonnet-4-5-20250929'
+    if (areAnthropicModelsDisabled() && isAnthropicModel(testedModel)) {
+      logger.warn(
+        `⏭️ Blocked console account test for ${testedModel}: ${ANTHROPIC_MODELS_DISABLED_MESSAGE}`
+      )
+      writeDisabledTestStream(responseStream)
+      return
+    }
 
     try {
       const account = await claudeConsoleAccountService.getAccount(accountId)

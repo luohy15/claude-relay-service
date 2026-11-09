@@ -13,8 +13,26 @@ const apiKeyService = require('../services/apiKeyService')
 const GeminiToOpenAIConverter = require('../services/geminiToOpenAI')
 const CodexToOpenAIConverter = require('../services/codexToOpenAI')
 const { isNativeModelPrefix } = require('../utils/modelHelper')
+const {
+  areAnthropicModelsDisabled,
+  MISSING_MODEL_BODY
+} = require('../middleware/anthropicModelGuard')
 
 const router = express.Router()
+
+// 缺模型时不再默认成 Claude。开关关闭才保留原来的 Claude 默认值。
+function resolveRequestModel(req, res) {
+  const rawModel = req.body && req.body.model
+  const model = typeof rawModel === 'string' ? rawModel.trim() : rawModel
+  if (model) {
+    return model
+  }
+  if (areAnthropicModelsDisabled()) {
+    res.status(400).json(MISSING_MODEL_BODY)
+    return null
+  }
+  return 'claude-3-5-sonnet-20241022'
+}
 
 // 🔍 根据模型名称检测后端类型
 function detectBackendFromModel(modelName) {
@@ -351,7 +369,10 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
       })
     }
 
-    const requestedModel = req.body.model || 'claude-3-5-sonnet-20241022'
+    const requestedModel = resolveRequestModel(req, res)
+    if (!requestedModel) {
+      return
+    }
     req.body.model = requestedModel // 确保模型已设置
 
     // 🛣️ 统一 /api 挂载点：按请求路径将非原生前缀（claude-/gemini-/gpt-）的模型直接路由到
@@ -395,7 +416,10 @@ router.post('/v1/completions', authenticateApiKey, async (req, res) => {
 
     // 将传统 completions 格式转换为 chat 格式
     const originalBody = req.body
-    const requestedModel = originalBody.model || 'claude-3-5-sonnet-20241022'
+    const requestedModel = resolveRequestModel(req, res)
+    if (!requestedModel) {
+      return
+    }
 
     req.body = {
       model: requestedModel,

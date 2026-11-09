@@ -6,6 +6,11 @@
 const cron = require('node-cron')
 const redis = require('../models/redis')
 const logger = require('../utils/logger')
+const { isAnthropicModel } = require('../utils/modelHelper')
+const {
+  areAnthropicModelsDisabled,
+  ANTHROPIC_MODELS_DISABLED_MESSAGE
+} = require('../middleware/anthropicModelGuard')
 
 class AccountTestSchedulerService {
   constructor() {
@@ -191,6 +196,17 @@ class AccountTestSchedulerService {
    */
   async _runAccountTest(accountId, platform, model) {
     const accountKey = `${platform}:${accountId}`
+
+    if (areAnthropicModelsDisabled() && (platform === 'claude' || isAnthropicModel(model))) {
+      logger.warn(
+        `⏭️ Skipping ${platform} account test ${accountId} (${model}): ${ANTHROPIC_MODELS_DISABLED_MESSAGE}`
+      )
+      return {
+        success: false,
+        error: ANTHROPIC_MODELS_DISABLED_MESSAGE,
+        timestamp: new Date().toISOString()
+      }
+    }
 
     // 避免重复测试
     if (this.testingAccounts.has(accountKey)) {

@@ -394,6 +394,62 @@ function resolveVendorFromModel(modelName) {
   return route ? route.vendor : null
 }
 
+const ANTHROPIC_FAMILY_MARKERS = ['opus', 'sonnet', 'haiku', 'fable']
+
+/**
+ * 归一化模型 id，供 Anthropic 禁用判断使用。
+ * trim + lowercase，去掉 ccr, 供应商前缀和客户端 [1m] 后缀。
+ * @param {string} modelName
+ * @returns {string}
+ */
+function normalizeAnthropicModelId(modelName) {
+  if (typeof modelName !== 'string') {
+    return ''
+  }
+
+  let normalized = modelName.trim().toLowerCase()
+  if (!normalized) {
+    return ''
+  }
+
+  if (normalized.startsWith('ccr,')) {
+    normalized = normalized.slice(4).trim()
+  }
+
+  normalized = normalized.replace(CLIENT_CAPABILITY_SUFFIX_PATTERN, '').trim()
+  return normalized
+}
+
+/**
+ * 请求是否会落到 Claude/Anthropic，或落到会自行选择 Claude 的 OpenRouter auto。
+ * 命中：以 claude 开头、包含 anthropic、包含 opus/sonnet/haiku/fable，或 openrouter/auto*。
+ * @param {string} modelName
+ * @returns {boolean}
+ */
+function isAnthropicModel(modelName) {
+  const normalized = normalizeAnthropicModelId(modelName)
+  if (!normalized) {
+    return false
+  }
+
+  if (normalized.startsWith('openrouter/auto')) {
+    return true
+  }
+  if (normalized.startsWith('claude') || normalized.includes('anthropic')) {
+    return true
+  }
+  return ANTHROPIC_FAMILY_MARKERS.some((marker) => normalized.includes(marker))
+}
+
+/**
+ * 入口应拒绝的模型。当前与 isAnthropicModel 相同（含 openrouter/auto*）。
+ * @param {string} modelName
+ * @returns {boolean}
+ */
+function isBlockedModel(modelName) {
+  return isAnthropicModel(modelName)
+}
+
 module.exports = {
   parseVendorPrefixedModel,
   hasVendorPrefix,
@@ -406,5 +462,7 @@ module.exports = {
   stripModelCapabilitySuffix,
   isNativeModelPrefix,
   DEFAULT_MODEL_VENDOR_ROUTES,
-  resolveVendorFromModel
+  resolveVendorFromModel,
+  isAnthropicModel,
+  isBlockedModel
 }

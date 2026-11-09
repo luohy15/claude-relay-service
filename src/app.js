@@ -40,6 +40,7 @@ const {
   requestSizeLimit
 } = require('./middleware/auth')
 const { browserFallbackMiddleware } = require('./middleware/browserFallback')
+const { anthropicModelGuard } = require('./middleware/anthropicModelGuard')
 
 class Application {
   constructor() {
@@ -327,6 +328,16 @@ class Application {
       } else {
         logger.warn('⚠️ Admin SPA dist directory not found, skipping /admin-next route')
       }
+
+      // 在调度之前拒绝 Claude/Anthropic 模型。挂在这些前缀上，认证仍在各路由内。
+      this.app.use('/api', anthropicModelGuard)
+      this.app.use('/claude', anthropicModelGuard)
+      this.app.use('/openai', anthropicModelGuard)
+      this.app.use('/droid', anthropicModelGuard)
+      this.app.use('/antigravity/api', anthropicModelGuard)
+      this.app.use('/gemini-cli/api', anthropicModelGuard)
+      this.app.use('/codex/api', anthropicModelGuard)
+      this.app.use('/grok/api', anthropicModelGuard)
 
       // 🛣️ 路由
       this.app.use('/api', apiRoutes)

@@ -1,4 +1,6 @@
 const logger = require('../utils/logger')
+const { isAnthropicModel } = require('../utils/modelHelper')
+const { areAnthropicModelsDisabled } = require('../middleware/anthropicModelGuard')
 
 /**
  * 模型服务
@@ -81,8 +83,12 @@ class ModelService {
     const models = []
     const now = Math.floor(Date.now() / 1000)
 
+    const hideAnthropic = areAnthropicModelsDisabled()
     for (const [_service, config] of Object.entries(this.supportedModels)) {
       for (const modelId of config.models) {
+        if (hideAnthropic && isAnthropicModel(modelId)) {
+          continue
+        }
         models.push({
           id: modelId,
           object: 'model',

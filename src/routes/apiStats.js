@@ -13,16 +13,37 @@ const {
 } = require('../utils/testPayloadHelper')
 const modelsConfig = require('../../config/models')
 const { getSafeMessage } = require('../utils/errorSanitizer')
+const { isAnthropicModel } = require('../utils/modelHelper')
+const { areAnthropicModelsDisabled } = require('../middleware/anthropicModelGuard')
 
 const router = express.Router()
 
 // 📋 获取可用模型列表（公开接口）
+function visibleModels(models) {
+  if (!areAnthropicModelsDisabled()) {
+    return models
+  }
+  return (models || []).filter((model) => {
+    const modelId = typeof model === 'string' ? model : model.value || model.id
+    return !isAnthropicModel(modelId)
+  })
+}
+
+function visiblePlatforms(platforms) {
+  if (!areAnthropicModelsDisabled()) {
+    return platforms
+  }
+  return Object.fromEntries(
+    Object.entries(platforms || {}).map(([platform, models]) => [platform, visibleModels(models)])
+  )
+}
+
 router.get('/models', (req, res) => {
   const { service } = req.query
 
   if (service) {
     // 返回指定服务的模型
-    const models = modelsConfig.getModelsByService(service)
+    const models = visibleModels(modelsConfig.getModelsByService(service))
     return res.json({
       success: true,
       data: models
@@ -33,12 +54,12 @@ router.get('/models', (req, res) => {
   res.json({
     success: true,
     data: {
-      claude: modelsConfig.CLAUDE_MODELS,
-      gemini: modelsConfig.GEMINI_MODELS,
-      openai: modelsConfig.OPENAI_MODELS,
-      other: modelsConfig.OTHER_MODELS,
-      all: modelsConfig.getAllModels(),
-      platforms: modelsConfig.PLATFORM_TEST_MODELS
+      claude: visibleModels(modelsConfig.CLAUDE_MODELS),
+      gemini: visibleModels(modelsConfig.GEMINI_MODELS),
+      openai: visibleModels(modelsConfig.OPENAI_MODELS),
+      other: visibleModels(modelsConfig.OTHER_MODELS),
+      all: visibleModels(modelsConfig.getAllModels()),
+      platforms: visiblePlatforms(modelsConfig.PLATFORM_TEST_MODELS)
     }
   })
 })

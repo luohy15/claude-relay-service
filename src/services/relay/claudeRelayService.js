@@ -8,7 +8,12 @@ const unifiedClaudeScheduler = require('../scheduler/unifiedClaudeScheduler')
 const sessionHelper = require('../../utils/sessionHelper')
 const logger = require('../../utils/logger')
 const config = require('../../../config/config')
-const { getRateLimitModelFamily } = require('../../utils/modelHelper')
+const { getRateLimitModelFamily, isAnthropicModel } = require('../../utils/modelHelper')
+const {
+  areAnthropicModelsDisabled,
+  ANTHROPIC_MODELS_DISABLED_MESSAGE,
+  writeDisabledTestStream
+} = require('../../middleware/anthropicModelGuard')
 const claudeCodeHeadersService = require('../claudeCodeHeadersService')
 const redis = require('../../models/redis')
 const ClaudeCodeValidator = require('../../validators/clients/claudeCodeValidator')
@@ -3454,6 +3459,15 @@ class ClaudeRelayService {
 
   // 🧪 测试账号连接（供Admin API使用，直接复用 _makeClaudeStreamRequestWithUsageCapture）
   async testAccountConnection(accountId, responseStream, model = 'claude-sonnet-4-5-20250929') {
+    if (areAnthropicModelsDisabled()) {
+      const label = isAnthropicModel(model) ? model : 'claude-official'
+      logger.warn(
+        `⏭️ Blocked Claude account test for ${label}: ${ANTHROPIC_MODELS_DISABLED_MESSAGE}`
+      )
+      writeDisabledTestStream(responseStream)
+      return
+    }
+
     const testRequestBody = createClaudeTestPayload(model, { stream: true })
 
     try {
@@ -3512,6 +3526,18 @@ class ClaudeRelayService {
   // 🧪 非流式测试账号连接（供定时任务使用）
   // 复用流式请求方法，收集结果后返回
   async testAccountConnectionSync(accountId, model = 'claude-sonnet-4-5-20250929') {
+    if (areAnthropicModelsDisabled()) {
+      const label = isAnthropicModel(model) ? model : 'claude-official'
+      logger.warn(
+        `⏭️ Blocked Claude account sync test for ${label}: ${ANTHROPIC_MODELS_DISABLED_MESSAGE}`
+      )
+      return {
+        success: false,
+        error: ANTHROPIC_MODELS_DISABLED_MESSAGE,
+        timestamp: new Date().toISOString()
+      }
+    }
+
     const testRequestBody = createClaudeTestPayload(model, { stream: true })
     const startTime = Date.now()
 

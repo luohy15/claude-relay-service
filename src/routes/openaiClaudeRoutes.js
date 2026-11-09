@@ -17,7 +17,8 @@ const { getSafeMessage } = require('../utils/errorSanitizer')
 const sessionHelper = require('../utils/sessionHelper')
 const { updateRateLimitCounters } = require('../utils/rateLimitHelper')
 const pricingService = require('../services/pricingService')
-const { getEffectiveModel } = require('../utils/modelHelper')
+const { getEffectiveModel, isAnthropicModel } = require('../utils/modelHelper')
+const { areAnthropicModelsDisabled } = require('../middleware/anthropicModelGuard')
 const { createRequestDetailMeta } = require('../utils/requestDetailHelper')
 
 // 🔧 辅助函数：检查 API Key 权限
@@ -85,6 +86,10 @@ router.get('/v1/models', authenticateApiKey, async (req, res) => {
         owned_by: 'anthropic'
       }
     ]
+
+    if (areAnthropicModelsDisabled()) {
+      models = models.filter((model) => !isAnthropicModel(model.id))
+    }
 
     // 如果启用了模型限制，视为黑名单：过滤掉受限模型
     if (apiKeyData.enableModelRestriction && apiKeyData.restrictedModels?.length > 0) {
