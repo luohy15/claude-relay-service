@@ -14,6 +14,7 @@ const {
   extractOpenAICacheReadTokens
 } = require('../../utils/requestDetailHelper')
 const { attachHeartbeat } = require('../../utils/sseHeartbeat')
+const { grokNativeHeaders, normalizeGrokResponsesBody } = require('../../utils/grokResponsesCompat')
 
 // lastUsedAt 更新节流（每账户 60 秒内最多更新一次，使用 LRU 防止内存泄漏）
 const lastUsedAtThrottle = new LRUCache(1000) // 最多缓存 1000 个账户
@@ -134,13 +135,23 @@ class OpenAIResponsesRelayService {
         'Content-Type': 'application/json'
       }
 
-      // Grok（grok.com 订阅 OAuth）专属：cli-chat-proxy 的鉴权中间件要求这个头部才会
-      // 把 Bearer token 当作 CLI 会话 token 校验；grok-build 客户端本身不会带上这个头
-      // （客户端把自定义模型当作第三方 API Key 处理），需要由 relay 注入。
-      // 其余 x-grok-* / x-grok-model-override 等头部由 grok-build 客户端自行携带，
-      // 已通过上面的 filterForOpenAI 透传，无需在此重复处理。
+      // Grok（grok.com 订阅 OAuth）专属：
+      // 1. cli-chat-proxy 要求 X-XAI-Token-Auth 才会把 Bearer 当作 CLI 会话 token。
+      //    grok-build 不带这个头，需要 relay 注入。其余客户端自带的 x-grok-* 仍透传。
+      // 2. 原生 /openai 上的 codex 客户端不带 grok CLI 指纹，并且会发送 grok 拒绝的
+      //    namespace 工具和 web_search.external_web_access。只在本账户类型上补头并归一化。
       if (this.accountType === 'grok') {
         headers['X-XAI-Token-Auth'] = 'xai-grok-cli'
+        Object.assign(headers, grokNativeHeaders())
+        const normalized = normalizeGrokResponsesBody(req.body)
+        req.body = normalized.body
+        if (normalized.droppedNamespaceTools > 0 || normalized.strippedExternalWebAccess > 0) {
+          logger.info('🧼 Normalized grok Responses tools', {
+            accountId: account.id,
+            droppedNamespaceTools: normalized.droppedNamespaceTools,
+            strippedExternalWebAccess: normalized.strippedExternalWebAccess
+          })
+        }
       }
 
       // 处理 User-Agent
