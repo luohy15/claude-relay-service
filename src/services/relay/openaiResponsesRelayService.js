@@ -171,11 +171,16 @@ class OpenAIResponsesRelayService {
         Object.assign(headers, grokNativeHeaders())
         const normalized = normalizeGrokResponsesBody(req.body)
         req.body = normalized.body
-        if (normalized.droppedNamespaceTools > 0 || normalized.strippedExternalWebAccess > 0) {
+        if (
+          normalized.droppedNamespaceTools > 0 ||
+          normalized.strippedExternalWebAccess > 0 ||
+          normalized.strippedNullReasoningContent > 0
+        ) {
           logger.info('🧼 Normalized grok Responses tools', {
             accountId: account.id,
             droppedNamespaceTools: normalized.droppedNamespaceTools,
-            strippedExternalWebAccess: normalized.strippedExternalWebAccess
+            strippedExternalWebAccess: normalized.strippedExternalWebAccess,
+            strippedNullReasoningContent: normalized.strippedNullReasoningContent
           })
         }
       }

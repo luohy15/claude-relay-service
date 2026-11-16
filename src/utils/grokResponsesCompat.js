@@ -1,7 +1,9 @@
 // Native /openai Responses requests from the codex CLI are not grok-shaped.
-// The grok account path injects the CLI fingerprint and drops the two tool
-// shapes grok rejects. tool_choice is left unchanged: this relay does not see
-// a namespace tool_choice, and rewriting one would be a guess.
+// The grok account path injects the CLI fingerprint, drops the two tool
+// shapes grok rejects, and deletes a null content field on replayed reasoning
+// items. encrypted_content and every other field stay as sent. A string input
+// is not parsed. tool_choice is left unchanged: this relay does not see a
+// namespace tool_choice, and rewriting one would be a guess.
 
 const GROK_CLIENT_VERSION = '1.0.46'
 const GROK_CLIENT_IDENTIFIER = 'grok-shell'
@@ -17,7 +19,8 @@ function emptyResult(body) {
   return {
     body,
     droppedNamespaceTools: 0,
-    strippedExternalWebAccess: 0
+    strippedExternalWebAccess: 0,
+    strippedNullReasoningContent: 0
   }
 }
 
@@ -33,38 +36,84 @@ function stripExternalWebAccess(tool) {
   return { tool: next, stripped: true }
 }
 
+function normalizeReasoningInput(input) {
+  if (!Array.isArray(input)) {
+    return { input, strippedNullReasoningContent: 0, changed: false }
+  }
+
+  let strippedNullReasoningContent = 0
+  const next = []
+  for (const item of input) {
+    if (
+      item &&
+      typeof item === 'object' &&
+      !Array.isArray(item) &&
+      item.type === 'reasoning' &&
+      Object.prototype.hasOwnProperty.call(item, 'content') &&
+      item.content === null
+    ) {
+      const copy = { ...item }
+      delete copy.content
+      next.push(copy)
+      strippedNullReasoningContent += 1
+      continue
+    }
+    next.push(item)
+  }
+
+  if (strippedNullReasoningContent === 0) {
+    return { input, strippedNullReasoningContent: 0, changed: false }
+  }
+
+  return { input: next, strippedNullReasoningContent, changed: true }
+}
+
 function normalizeGrokResponsesBody(body) {
-  if (!body || typeof body !== 'object' || Array.isArray(body) || !Array.isArray(body.tools)) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return emptyResult(body)
   }
+
+  const reasoning = normalizeReasoningInput(body.input)
 
   let droppedNamespaceTools = 0
   let strippedExternalWebAccess = 0
-  let changed = false
-  const tools = []
+  let toolsChanged = false
+  let tools = null
 
-  for (const tool of body.tools) {
-    if (tool && typeof tool === 'object' && !Array.isArray(tool) && tool.type === 'namespace') {
-      droppedNamespaceTools += 1
-      changed = true
-      continue
+  if (Array.isArray(body.tools)) {
+    tools = []
+    for (const tool of body.tools) {
+      if (tool && typeof tool === 'object' && !Array.isArray(tool) && tool.type === 'namespace') {
+        droppedNamespaceTools += 1
+        toolsChanged = true
+        continue
+      }
+      const stripped = stripExternalWebAccess(tool)
+      if (stripped.stripped) {
+        strippedExternalWebAccess += 1
+        toolsChanged = true
+      }
+      tools.push(stripped.tool)
     }
-    const stripped = stripExternalWebAccess(tool)
-    if (stripped.stripped) {
-      strippedExternalWebAccess += 1
-      changed = true
-    }
-    tools.push(stripped.tool)
   }
 
-  if (!changed) {
+  if (!reasoning.changed && !toolsChanged) {
     return emptyResult(body)
   }
 
+  const nextBody = { ...body }
+  if (toolsChanged) {
+    nextBody.tools = tools
+  }
+  if (reasoning.changed) {
+    nextBody.input = reasoning.input
+  }
+
   return {
-    body: { ...body, tools },
+    body: nextBody,
     droppedNamespaceTools,
-    strippedExternalWebAccess
+    strippedExternalWebAccess,
+    strippedNullReasoningContent: reasoning.strippedNullReasoningContent
   }
 }
 
