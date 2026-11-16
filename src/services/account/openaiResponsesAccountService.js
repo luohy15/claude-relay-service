@@ -5,6 +5,7 @@ const logger = require('../../utils/logger')
 const config = require('../../../config/config')
 const LRUCache = require('../../utils/lruCache')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const deepseekProvider = require('../deepseekProvider')
 
 class OpenAIResponsesAccountService {
   constructor() {
@@ -52,7 +53,8 @@ class OpenAIResponsesAccountService {
       quotaResetTime = '00:00', // 额度重置时间（HH:mm格式）
       rateLimitDuration = 60, // 限流时间（分钟）
       disableAutoProtection = false, // 是否关闭自动防护（429/401/400/529 不自动禁用）
-      providerEndpoint = 'responses' // Provider 端点类型：responses | auto
+      providerEndpoint = 'responses', // Provider 端点类型：responses | auto
+      provider = ''
     } = options
 
     // 验证必填字段
@@ -60,16 +62,19 @@ class OpenAIResponsesAccountService {
       throw new Error('Base API URL and API Key are required for OpenAI-Responses account')
     }
 
+    const normalizedConfig = deepseekProvider.normalizeResponsesAccountConfig({
+      provider,
+      baseApi,
+      providerEndpoint
+    })
+
     // 验证 providerEndpoint 枚举值
     const validEndpoints = ['responses', 'auto']
-    if (!validEndpoints.includes(providerEndpoint)) {
+    if (!validEndpoints.includes(normalizedConfig.providerEndpoint)) {
       throw new Error(
-        `Invalid providerEndpoint: ${providerEndpoint}. Must be one of: ${validEndpoints.join(', ')}`
+        `Invalid providerEndpoint: ${normalizedConfig.providerEndpoint}. Must be one of: ${validEndpoints.join(', ')}`
       )
     }
-
-    // 规范化 baseApi（确保不以 / 结尾）
-    const normalizedBaseApi = baseApi.endsWith('/') ? baseApi.slice(0, -1) : baseApi
 
     const accountId = uuidv4()
 
@@ -78,7 +83,8 @@ class OpenAIResponsesAccountService {
       platform: 'openai-responses',
       name,
       description,
-      baseApi: normalizedBaseApi,
+      baseApi: normalizedConfig.baseApi,
+      provider: normalizedConfig.provider,
       apiKey: this._encryptSensitiveData(apiKey),
       userAgent,
       priority: priority.toString(),
@@ -106,7 +112,7 @@ class OpenAIResponsesAccountService {
       quotaResetTime,
       quotaStoppedAt: '',
       disableAutoProtection: disableAutoProtection.toString(), // 关闭自动防护
-      providerEndpoint // Provider 端点类型：responses(默认) | auto
+      providerEndpoint: normalizedConfig.providerEndpoint
     }
 
     // 保存到 Redis
@@ -142,7 +148,7 @@ class OpenAIResponsesAccountService {
       }
     }
 
-    return accountData
+    return this._deriveResponsesProvider(accountData)
   }
 
   // 更新账户
@@ -162,11 +168,23 @@ class OpenAIResponsesAccountService {
       updates.proxy = updates.proxy ? JSON.stringify(updates.proxy) : ''
     }
 
-    // 规范化 baseApi
-    if (updates.baseApi) {
-      updates.baseApi = updates.baseApi.endsWith('/')
-        ? updates.baseApi.slice(0, -1)
-        : updates.baseApi
+    // 官方 DeepSeek 主机归一到 origin，并强制 provider + /responses
+    if (
+      updates.baseApi !== undefined ||
+      updates.provider !== undefined ||
+      updates.providerEndpoint !== undefined
+    ) {
+      const normalizedConfig = deepseekProvider.normalizeResponsesAccountConfig({
+        provider: updates.provider !== undefined ? updates.provider : account.provider,
+        baseApi: updates.baseApi !== undefined ? updates.baseApi : account.baseApi,
+        providerEndpoint:
+          updates.providerEndpoint !== undefined
+            ? updates.providerEndpoint
+            : account.providerEndpoint || 'responses'
+      })
+      updates.baseApi = normalizedConfig.baseApi
+      updates.provider = normalizedConfig.provider
+      updates.providerEndpoint = normalizedConfig.providerEndpoint
     }
 
     // ✅ 直接保存 subscriptionExpiresAt（如果提供）
@@ -282,7 +300,7 @@ class OpenAIResponsesAccountService {
       accountData.expiresAt = accountData.subscriptionExpiresAt || null
       accountData.platform = accountData.platform || 'openai-responses'
 
-      accounts.push(accountData)
+      accounts.push(this._deriveResponsesProvider(accountData))
     })
 
     return accounts
@@ -548,6 +566,19 @@ class OpenAIResponsesAccountService {
     }
 
     return { success: true, message: 'Account status reset successfully' }
+  }
+
+  // 旧数据没有 provider 时，按 baseApi 主机推导。不回写 Redis。
+  _deriveResponsesProvider(accountData) {
+    if (!accountData) {
+      return accountData
+    }
+    if (deepseekProvider.isDeepSeekResponsesBaseApi(accountData.baseApi)) {
+      accountData.provider = 'deepseek'
+    } else if (!accountData.provider) {
+      accountData.provider = ''
+    }
+    return accountData
   }
 
   // ⏰ 检查账户订阅是否已过期

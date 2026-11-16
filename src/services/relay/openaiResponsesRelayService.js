@@ -15,6 +15,7 @@ const {
 } = require('../../utils/requestDetailHelper')
 const { attachHeartbeat } = require('../../utils/sseHeartbeat')
 const { grokNativeHeaders, normalizeGrokResponsesBody } = require('../../utils/grokResponsesCompat')
+const deepseekProvider = require('../deepseekProvider')
 
 // lastUsedAt 更新节流（每账户 60 秒内最多更新一次，使用 LRU 防止内存泄漏）
 const lastUsedAtThrottle = new LRUCache(1000) // 最多缓存 1000 个账户
@@ -104,6 +105,9 @@ class OpenAIResponsesRelayService {
 
       // 构建目标 URL（根据 providerEndpoint 配置决定端点路径）
       const providerEndpoint = fullAccount.providerEndpoint || 'responses'
+      const deepseekOfficial =
+        fullAccount.provider === 'deepseek' ||
+        deepseekProvider.isDeepSeekResponsesBaseApi(fullAccount.baseApi)
       let targetPath = req.path
 
       // 根据 providerEndpoint 配置归一化路径
@@ -120,9 +124,31 @@ class OpenAIResponsesRelayService {
       }
       // providerEndpoint === 'auto' 时保持原始路径不变
 
+      if (deepseekOfficial) {
+        const compact =
+          targetPath === '/responses/compact' ||
+          targetPath === '/v1/responses/compact' ||
+          (req.originalUrl && req.originalUrl.includes('/responses/compact'))
+        if (compact) {
+          return res.status(400).json({
+            error: {
+              type: 'invalid_request_error',
+              message: 'DeepSeek Responses does not support /responses/compact'
+            }
+          })
+        }
+        if (targetPath !== '/responses') {
+          logger.info(`📝 Normalized DeepSeek path (${targetPath}) → /responses`)
+        }
+        targetPath = '/responses'
+      }
+
       // 防止 baseApi 已含 /v1 时路径重复（如 baseApi=http://host/v1 + targetPath=/v1/responses → /v1/v1/responses）
-      const baseApi = fullAccount.baseApi || ''
-      if (baseApi.endsWith('/v1') && targetPath.startsWith('/v1/')) {
+      // 官方 DeepSeek 固定打到 origin + /responses，不依赖 /v1/responses 是否存在。
+      const baseApi = deepseekOfficial
+        ? deepseekProvider.RESPONSES_DEFAULT_API_URL
+        : fullAccount.baseApi || ''
+      if (!deepseekOfficial && baseApi.endsWith('/v1') && targetPath.startsWith('/v1/')) {
         targetPath = targetPath.slice(3) // '/v1/responses' → '/responses'
       }
       const targetUrl = `${baseApi}${targetPath}`
@@ -154,6 +180,22 @@ class OpenAIResponsesRelayService {
         }
       }
 
+      let outboundBody = req.body
+      if (deepseekOfficial) {
+        try {
+          outboundBody = deepseekProvider.prepareDeepSeekResponsesBody(req.body)
+        } catch (error) {
+          return res.status(error.statusCode || 400).json(
+            error.errorPayload || {
+              error: {
+                type: 'invalid_request_error',
+                message: error.message
+              }
+            }
+          )
+        }
+      }
+
       // 处理 User-Agent
       if (fullAccount.userAgent) {
         // 使用自定义 User-Agent
@@ -170,7 +212,7 @@ class OpenAIResponsesRelayService {
         method: req.method,
         url: targetUrl,
         headers,
-        data: req.body,
+        data: outboundBody,
         timeout: this.defaultTimeout,
         responseType: req.body?.stream ? 'stream' : 'json',
         validateStatus: () => true, // 允许处理所有状态码
@@ -197,7 +239,7 @@ class OpenAIResponsesRelayService {
         targetUrl,
         method: req.method,
         stream: req.body?.stream || false,
-        model: req.body?.model || 'unknown',
+        model: outboundBody?.model || req.body?.model || 'unknown',
         userAgent: headers['User-Agent'] || 'not set'
       })
 

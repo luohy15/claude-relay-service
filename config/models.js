@@ -71,7 +71,11 @@ const PLATFORM_TEST_MODELS = {
   bedrock: BEDROCK_MODELS,
   gemini: GEMINI_MODELS,
   'gemini-api': GEMINI_MODELS,
-  'openai-responses': OPENAI_MODELS,
+  'openai-responses': [
+    ...OPENAI_MODELS,
+    { value: 'deepseek-flash', label: 'DeepSeek Flash' },
+    { value: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro' }
+  ],
   'azure-openai': [],
   droid: CLAUDE_MODELS,
   ccr: CLAUDE_MODELS,

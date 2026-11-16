@@ -6,6 +6,7 @@ const redis = require('../../models/redis')
 const logger = require('../../utils/logger')
 const { isSchedulable, sortAccountsByPriority } = require('../../utils/commonHelper')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const deepseekProvider = require('../deepseekProvider')
 
 class UnifiedOpenAIScheduler {
   constructor() {
@@ -61,13 +62,21 @@ class UnifiedOpenAIScheduler {
   // openai（ChatGPT/Codex OAuth）固定转发到 chatgpt.com，grok（grok.com 订阅 OAuth）固定转发到
   // cli-chat-proxy.grok.com；两者互不兼容，共享池/分组选择必须按 requestedModel 区分，避免把
   // grok 模型路由到 ChatGPT 后端，或把 GPT 模型路由到 grok 后端。
-  // openai-responses 是通用第三方兼容 API，按设计保持"支持所有模型"不做限制。
-  _isAccountTypeCompatibleWithModel(accountType, requestedModel) {
+  // openai-responses 默认支持所有模型，但官方 DeepSeek 账户只服务原生 DeepSeek id，
+  // 其它选择路径也必须跳过这些账户。
+  _isAccountTypeCompatibleWithModel(accountType, requestedModel, provider = '') {
+    const nativeDeepSeek = deepseekProvider.isNativeDeepSeekId(requestedModel)
     if (accountType === 'openai') {
-      return !requestedModel || !this._isGrokModel(requestedModel)
+      return !requestedModel || (!this._isGrokModel(requestedModel) && !nativeDeepSeek)
     }
     if (accountType === 'grok') {
       return !!requestedModel && this._isGrokModel(requestedModel)
+    }
+    if (accountType === 'openai-responses') {
+      if (provider === 'deepseek') {
+        return !!deepseekProvider.canonicalDeepSeekModel(requestedModel)
+      }
+      return !nativeDeepSeek
     }
     return true
   }
@@ -146,6 +155,26 @@ class UnifiedOpenAIScheduler {
   // 🎯 统一调度OpenAI账号
   async selectAccountForApiKey(apiKeyData, sessionHash = null, requestedModel = null) {
     try {
+      if (deepseekProvider.isNativeDeepSeekId(requestedModel)) {
+        const canonical = deepseekProvider.canonicalDeepSeekModel(requestedModel)
+        if (!canonical) {
+          const error = new Error(
+            `Unsupported DeepSeek model: ${deepseekProvider.stripCapabilitySuffix(requestedModel)}`
+          )
+          error.code = 'DEEPSEEK_MODEL_UNSUPPORTED'
+          error.statusCode = 400
+          error.httpStatus = 400
+          error.errorPayload = {
+            error: {
+              type: 'invalid_request_error',
+              message: error.message
+            }
+          }
+          throw error
+        }
+        return await this._selectDeepSeekResponsesAccount(apiKeyData, sessionHash, canonical)
+      }
+
       // 如果API Key绑定了专属账户或分组，优先使用
       if (apiKeyData.openaiAccountId) {
         // 检查是否是分组
@@ -154,7 +183,7 @@ class UnifiedOpenAIScheduler {
           logger.info(
             `🎯 API key ${apiKeyData.name} is bound to group ${groupId}, selecting from group`
           )
-          return await this.selectAccountFromGroup(groupId, sessionHash, requestedModel, apiKeyData)
+          return await this.selectAccountFromGroup(groupId, sessionHash, requestedModel)
         }
 
         // 普通专属账户 - 根据前缀判断是 OpenAI、OpenAI-Responses 还是 Grok 类型
@@ -334,7 +363,8 @@ class UnifiedOpenAIScheduler {
           // 验证映射的账户是否仍然可用
           const isAvailable = await this._isAccountAvailable(
             mappedAccount.accountId,
-            mappedAccount.accountType
+            mappedAccount.accountType,
+            requestedModel
           )
           if (isAvailable) {
             // 🚀 智能会话续期（续期 unified 映射键，按配置）
@@ -504,6 +534,22 @@ class UnifiedOpenAIScheduler {
         account.status !== 'error' &&
         (account.accountType === 'shared' || !account.accountType)
       ) {
+        // 官方 DeepSeek 只走专用池，不能被 gpt/grok 或未指定模型选中
+        if (
+          account.provider === 'deepseek' ||
+          deepseekProvider.isDeepSeekResponsesBaseApi(account.baseApi) ||
+          !this._isAccountTypeCompatibleWithModel(
+            'openai-responses',
+            requestedModel,
+            account.provider || ''
+          )
+        ) {
+          logger.debug(
+            `⏭️ Skipping OpenAI-Responses account ${account.name} - provider scope excludes model ${requestedModel || '(unspecified)'}`
+          )
+          continue
+        }
+
         // 检查 rateLimitStatus 或 status === 'rateLimited'
         const hasRateLimitFlag =
           this._hasRateLimitFlag(account.rateLimitStatus) || account.status === 'rateLimited'
@@ -650,9 +696,146 @@ class UnifiedOpenAIScheduler {
     return availableAccounts
   }
 
+  async _deepSeekResponsesAccountUsable(account) {
+    if (!account || account.provider !== 'deepseek') {
+      return false
+    }
+    const active = account.isActive === true || account.isActive === 'true'
+    if (!active || account.status === 'error' || account.status === 'unauthorized') {
+      return false
+    }
+    const rateLimited =
+      this._isRateLimited(account.rateLimitStatus) || account.status === 'rateLimited'
+    if (rateLimited) {
+      const cleared = await openaiResponsesAccountService.checkAndClearRateLimit(account.id)
+      if (!cleared) {
+        return false
+      }
+    } else if (!isSchedulable(account.schedulable)) {
+      return false
+    }
+    if (openaiResponsesAccountService.isSubscriptionExpired(account)) {
+      return false
+    }
+    if (await upstreamErrorHelper.isTempUnavailable(account.id, 'openai-responses')) {
+      return false
+    }
+    return true
+  }
+
+  // 原生 DeepSeek 只在官方 Responses 账户中选择，失败也不回退到 grok 或通用账户。
+  async _selectDeepSeekResponsesAccount(apiKeyData, sessionHash, canonicalModel) {
+    const binding =
+      typeof apiKeyData?.openaiAccountId === 'string' ? apiKeyData.openaiAccountId : ''
+
+    if (binding.startsWith('responses:')) {
+      const bound = await openaiResponsesAccountService.getAccount(
+        binding.replace('responses:', '')
+      )
+      if (bound && bound.provider === 'deepseek') {
+        if (await this._deepSeekResponsesAccountUsable(bound)) {
+          logger.info(
+            `🎯 Using bound DeepSeek responses account: ${bound.name} (${bound.id}) for ${canonicalModel}`
+          )
+          await this.updateAccountLastUsed(bound.id, 'openai-responses')
+          return { accountId: bound.id, accountType: 'openai-responses' }
+        }
+        logger.warn(
+          `⚠️ Bound DeepSeek responses account ${bound.id} is unavailable; staying inside the DeepSeek pool`
+        )
+      } else {
+        logger.info(`ℹ️ Ignoring non-DeepSeek dedicated binding ${binding} for ${canonicalModel}`)
+      }
+    }
+
+    if (binding.startsWith('group:')) {
+      return await this.selectAccountFromGroup(
+        binding.replace('group:', ''),
+        sessionHash,
+        canonicalModel,
+        'deepseek'
+      )
+    }
+
+    if (sessionHash) {
+      const mappedAccount = await this._getSessionMapping(sessionHash)
+      if (mappedAccount && mappedAccount.accountType === 'openai-responses') {
+        const mapped = await openaiResponsesAccountService.getAccount(mappedAccount.accountId)
+        if (
+          mapped &&
+          mapped.provider === 'deepseek' &&
+          (await this._deepSeekResponsesAccountUsable(mapped))
+        ) {
+          await this._extendSessionMappingTTL(sessionHash)
+          logger.info(
+            `🎯 Using sticky DeepSeek responses account: ${mapped.id} for session ${sessionHash}`
+          )
+          await this.updateAccountLastUsed(mapped.id, 'openai-responses')
+          return { accountId: mapped.id, accountType: 'openai-responses' }
+        }
+      }
+      if (mappedAccount) {
+        await this._deleteSessionMapping(sessionHash)
+      }
+    }
+
+    const accounts = await openaiResponsesAccountService.getAllAccounts()
+    const usable = []
+    for (const account of accounts) {
+      if (account.provider !== 'deepseek') {
+        continue
+      }
+      if (account.accountType && account.accountType !== 'shared') {
+        continue
+      }
+      if (!(await this._deepSeekResponsesAccountUsable(account))) {
+        continue
+      }
+      usable.push({
+        ...account,
+        accountId: account.id,
+        accountType: 'openai-responses',
+        priority: parseInt(account.priority) || 50,
+        lastUsedAt: account.lastUsedAt || '0'
+      })
+    }
+
+    if (usable.length === 0) {
+      const error = new Error(`No available DeepSeek accounts support model: ${canonicalModel}`)
+      error.code = 'NO_DEEPSEEK_ACCOUNT'
+      error.statusCode = 400
+      error.httpStatus = 400
+      error.errorPayload = {
+        error: {
+          type: 'invalid_request_error',
+          message: error.message
+        }
+      }
+      throw error
+    }
+
+    const selected = sortAccountsByPriority(usable)[0]
+    if (sessionHash) {
+      await this._setSessionMapping(sessionHash, selected.accountId, 'openai-responses')
+    }
+    logger.info(
+      `🎯 Selected DeepSeek responses account: ${selected.name} (${selected.accountId}) for ${canonicalModel}`
+    )
+    await this.updateAccountLastUsed(selected.accountId, 'openai-responses')
+    return { accountId: selected.accountId, accountType: 'openai-responses' }
+  }
+
   // 🔍 检查账户是否可用
-  async _isAccountAvailable(accountId, accountType) {
+  async _isAccountAvailable(accountId, accountType, requestedModel = null) {
     try {
+      if (
+        requestedModel &&
+        accountType !== 'openai-responses' &&
+        !this._isAccountTypeCompatibleWithModel(accountType, requestedModel)
+      ) {
+        return false
+      }
+
       if (accountType === 'openai') {
         const account = await openaiAccountService.getAccount(accountId)
         if (
@@ -695,6 +878,15 @@ class UnifiedOpenAIScheduler {
           (account.isActive !== true && account.isActive !== 'true') ||
           account.status === 'error' ||
           account.status === 'unauthorized'
+        ) {
+          return false
+        }
+        if (
+          !this._isAccountTypeCompatibleWithModel(
+            'openai-responses',
+            requestedModel,
+            account.provider || ''
+          )
         ) {
           return false
         }
@@ -990,7 +1182,12 @@ class UnifiedOpenAIScheduler {
   }
 
   // 👥 从分组中选择账户
-  async selectAccountFromGroup(groupId, sessionHash = null, requestedModel = null) {
+  async selectAccountFromGroup(
+    groupId,
+    sessionHash = null,
+    requestedModel = null,
+    providerScope = null
+  ) {
     try {
       // 获取分组信息
       const group = await accountGroupService.getGroup(groupId)
@@ -1017,7 +1214,8 @@ class UnifiedOpenAIScheduler {
           if (isInGroup) {
             const isAvailable = await this._isAccountAvailable(
               mappedAccount.accountId,
-              mappedAccount.accountType
+              mappedAccount.accountType,
+              requestedModel
             )
             if (isAvailable) {
               // 🚀 智能会话续期（续期 unified 映射键，按配置）
@@ -1038,6 +1236,13 @@ class UnifiedOpenAIScheduler {
       // 获取分组成员
       const memberIds = await accountGroupService.getGroupMembers(groupId)
       if (memberIds.length === 0) {
+        if (providerScope === 'deepseek') {
+          const error = new Error(`No available DeepSeek accounts support model: ${requestedModel}`)
+          error.code = 'NO_DEEPSEEK_ACCOUNT'
+          error.statusCode = 400
+          error.httpStatus = 400
+          throw error
+        }
         const error = new Error(`Group ${group.name} has no members`)
         error.statusCode = 402 // Payment Required - 资源耗尽
         throw error
@@ -1067,8 +1272,24 @@ class UnifiedOpenAIScheduler {
           (account.isActive === true || account.isActive === 'true') &&
           account.status !== 'error'
         ) {
+          const deepseekScope = providerScope === 'deepseek'
+          if (
+            deepseekScope &&
+            (accountType !== 'openai-responses' || account.provider !== 'deepseek')
+          ) {
+            continue
+          }
+          if (!deepseekScope && account.provider === 'deepseek') {
+            continue
+          }
           // Grok 只服务于 grok 系列模型，OpenAI（ChatGPT/Codex）不服务于 grok 系列模型
-          if (!this._isAccountTypeCompatibleWithModel(accountType, requestedModel)) {
+          if (
+            !this._isAccountTypeCompatibleWithModel(
+              accountType,
+              requestedModel,
+              account.provider || ''
+            )
+          ) {
             logger.debug(
               `⏭️ Skipping group member ${accountType} account ${account.name} - requested model ${requestedModel || '(unspecified)'} is incompatible`
             )
@@ -1162,6 +1383,13 @@ class UnifiedOpenAIScheduler {
       }
 
       if (availableAccounts.length === 0) {
+        if (providerScope === 'deepseek') {
+          const error = new Error(`No available DeepSeek accounts support model: ${requestedModel}`)
+          error.code = 'NO_DEEPSEEK_ACCOUNT'
+          error.statusCode = 400
+          error.httpStatus = 400
+          throw error
+        }
         const error = new Error(`No available accounts in group ${group.name}`)
         error.statusCode = 402 // Payment Required - 资源耗尽
         throw error

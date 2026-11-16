@@ -14,6 +14,7 @@ const logger = require('../../utils/logger')
 const webhookNotifier = require('../../utils/webhookNotifier')
 const { formatAccountExpiry, mapExpiryField } = require('./utils')
 const { createOpenAITestPayload, extractErrorMessage } = require('../../utils/testPayloadHelper')
+const deepseekProvider = require('../../services/deepseekProvider')
 const { getProxyAgent } = require('../../utils/proxyHelper')
 
 const router = express.Router()
@@ -181,7 +182,7 @@ router.post('/openai-responses-accounts', authenticateAdmin, async (req, res) =>
     res.json({ success: true, data: formattedAccount })
   } catch (error) {
     logger.error('Failed to create OpenAI-Responses account:', error)
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       success: false,
       error: error.message
     })
@@ -263,7 +264,7 @@ router.put('/openai-responses-accounts/:id', authenticateAdmin, async (req, res)
     res.json({ success: true, ...result })
   } catch (error) {
     logger.error('Failed to update OpenAI-Responses account:', error)
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       success: false,
       error: error.message
     })
@@ -458,7 +459,6 @@ router.post('/openai-responses-accounts/:id/reset-usage', authenticateAdmin, asy
 // 测试 OpenAI-Responses 账户连通性
 router.post('/openai-responses-accounts/:accountId/test', authenticateAdmin, async (req, res) => {
   const { accountId } = req.params
-  const { model = 'gpt-4o-mini' } = req.body
   const startTime = Date.now()
 
   try {
@@ -473,15 +473,35 @@ router.post('/openai-responses-accounts/:accountId/test', authenticateAdmin, asy
     }
 
     // 构造测试请求（根据 providerEndpoint 和 baseApi 决定端点路径）
-    const baseUrl = account.baseApi || 'https://api.openai.com'
+    const deepseekOfficial =
+      account.provider === 'deepseek' ||
+      deepseekProvider.isDeepSeekResponsesBaseApi(account.baseApi)
+    const explicitModel = req.body?.model
+    let model = explicitModel || 'gpt-4o-mini'
+    let baseUrl = account.baseApi || 'https://api.openai.com'
     const providerEndpoint = account.providerEndpoint || 'responses'
     let endpointPath = '/responses'
-    if (providerEndpoint === 'auto') {
-      endpointPath = '/responses' // 测试时默认用 responses
-    }
-    // 防止 baseApi 已含 /v1 时路径重复
-    if (!baseUrl.endsWith('/v1')) {
-      endpointPath = `/v1${endpointPath}`
+    if (deepseekOfficial) {
+      const canonical = explicitModel
+        ? deepseekProvider.canonicalDeepSeekModel(explicitModel)
+        : 'deepseek-flash'
+      if (!canonical) {
+        return res.status(400).json({
+          success: false,
+          error: `Unsupported DeepSeek model: ${explicitModel}`
+        })
+      }
+      model = canonical
+      baseUrl = deepseekProvider.RESPONSES_DEFAULT_API_URL
+      endpointPath = '/responses'
+    } else {
+      if (providerEndpoint === 'auto') {
+        endpointPath = '/responses' // 测试时默认用 responses
+      }
+      // 防止 baseApi 已含 /v1 时路径重复
+      if (!baseUrl.endsWith('/v1')) {
+        endpointPath = `/v1${endpointPath}`
+      }
     }
     const apiUrl = `${baseUrl}${endpointPath}`
     const payload = createOpenAITestPayload(model, { stream: false })

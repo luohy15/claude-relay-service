@@ -8,6 +8,7 @@
  */
 
 const DEFAULT_API_URL = 'https://api.deepseek.com/anthropic'
+const RESPONSES_DEFAULT_API_URL = 'https://api.deepseek.com'
 const CANONICAL_MODELS = ['deepseek-flash', 'deepseek-v4-pro']
 const FLASH_ALIASES = ['deepseek-v4-flash', 'deepseek-v4-flash-vision-exp']
 
@@ -416,6 +417,108 @@ function redactSecret(value, secret) {
   return raw.split(secret).join('[redacted]')
 }
 
+function isDeepSeekResponsesBaseApi(baseApi) {
+  if (typeof baseApi !== 'string' || !baseApi.trim()) {
+    return false
+  }
+  let parsed
+  try {
+    parsed = new URL(baseApi.trim())
+  } catch (error) {
+    return false
+  }
+  return (
+    parsed.protocol === 'https:' &&
+    parsed.hostname === 'api.deepseek.com' &&
+    !parsed.port &&
+    !parsed.username &&
+    !parsed.password &&
+    !parsed.search &&
+    !parsed.hash
+  )
+}
+
+function deepSeekHostIntent(baseApi) {
+  if (typeof baseApi !== 'string' || !baseApi.trim()) {
+    return false
+  }
+  try {
+    return new URL(baseApi.trim()).hostname === 'api.deepseek.com'
+  } catch (error) {
+    return false
+  }
+}
+
+// Official Responses accounts are openai-responses rows whose host is
+// api.deepseek.com. Store the origin, force /responses, and mark provider.
+function normalizeResponsesAccountConfig({ provider, baseApi, providerEndpoint } = {}) {
+  const trimmed = typeof baseApi === 'string' ? baseApi.trim() : ''
+  const declared =
+    provider === undefined || provider === null || provider === ''
+      ? ''
+      : normalizeProvider(provider)
+  const official = isDeepSeekResponsesBaseApi(trimmed)
+
+  if (deepSeekHostIntent(trimmed) && !official) {
+    throw badRequest(
+      'DeepSeek Responses baseApi must be https://api.deepseek.com with no port, user, query, or hash'
+    )
+  }
+  if (declared === 'deepseek' && !official) {
+    throw badRequest('DeepSeek Responses baseApi must be https://api.deepseek.com')
+  }
+  if (official) {
+    return {
+      provider: 'deepseek',
+      baseApi: RESPONSES_DEFAULT_API_URL,
+      providerEndpoint: 'responses'
+    }
+  }
+
+  return {
+    provider: '',
+    baseApi: trimmed.endsWith('/') ? trimmed.slice(0, -1) : trimmed,
+    providerEndpoint: providerEndpoint || 'responses'
+  }
+}
+
+// Pure: returns a new body and does not strip unsupported Responses fields.
+function prepareDeepSeekResponsesBody(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    const error = new Error('Invalid request body')
+    error.statusCode = 400
+    error.httpStatus = 400
+    error.code = 'DEEPSEEK_MODEL_UNSUPPORTED'
+    error.errorPayload = {
+      error: {
+        type: 'invalid_request_error',
+        message: error.message
+      }
+    }
+    throw error
+  }
+
+  const canonical = canonicalDeepSeekModel(body.model)
+  if (!canonical) {
+    const error = new Error(`Unsupported DeepSeek model: ${body.model}`)
+    error.statusCode = 400
+    error.httpStatus = 400
+    error.code = 'DEEPSEEK_MODEL_UNSUPPORTED'
+    error.errorPayload = {
+      error: {
+        type: 'invalid_request_error',
+        message: error.message
+      }
+    }
+    throw error
+  }
+
+  return {
+    ...body,
+    model: canonical
+  }
+}
+
 function officialFirstModel(model) {
   return ['deepseek/deepseek-v4.1-flash-1017', 'deepseek/deepseek-v4.1-flash'].includes(
     stripCapabilitySuffix(model)
@@ -443,6 +546,10 @@ function attemptFailure({ status, code, headers, committed = false }) {
 module.exports = {
   officialFirstModel,
   attemptFailure,
+  RESPONSES_DEFAULT_API_URL,
+  isDeepSeekResponsesBaseApi,
+  normalizeResponsesAccountConfig,
+  prepareDeepSeekResponsesBody,
   findUnsupportedRequest,
   DEFAULT_API_URL,
   CANONICAL_MODELS,

@@ -97,6 +97,9 @@
 - `document`、`search_result`、`redacted_thinking`、MCP、container、code execution，以及文件型图片和本服务未开启的服务端 search/fetch，会在出网前返回 400。
 - `count_tokens` 若上游返回 404，中继回 `input_tokens: 0`。这是占位，不是真实估算。
 - 费用按官方峰时价估算（每百万 token，Flash 输入/缓存命中/输出 = 0.30/0.006/1.20，Pro = 1.32/0.044/3.96）。闲时减半，节假日另有安排；这里不计节假日，也不是发票金额。
+- `/openai`（codex）另建一个 OpenAI-Responses 账户，`baseApi` 填 `https://api.deepseek.com`，认证是 `Authorization: Bearer`。不要复用上面的 Claude Console 账户，也不要和 grok 或其它 OpenAI-Responses 账户混用。
+- 这条路径只接受原生 id：`deepseek-flash`、`deepseek-v4-pro`、两个 Flash 别名，以及带 `[1m]` 的同名 id。`/v1/responses` 和由 chat completions 转来的请求会改写成 origin 上的 `/responses`。`/responses/compact` 返回 400。没有可用的官方账户时返回 400，不会落到其它账户。
+- 请求体只改模型 id。DeepSeek 文档里不支持的字段原样转发，由上游忽略。OpenRouter 的 `deepseek/...` id 不走这条路径。
 
 ---
 
