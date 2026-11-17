@@ -14,7 +14,12 @@ const {
   extractOpenAICacheReadTokens
 } = require('../../utils/requestDetailHelper')
 const { attachHeartbeat } = require('../../utils/sseHeartbeat')
-const { grokNativeHeaders, normalizeGrokResponsesBody } = require('../../utils/grokResponsesCompat')
+const {
+  grokNativeHeaders,
+  normalizeGrokResponsesBody,
+  rewriteGrokResponseBody,
+  createGrokResponseStreamRewriter
+} = require('../../utils/grokResponsesCompat')
 const deepseekProvider = require('../deepseekProvider')
 
 // lastUsedAt 更新节流（每账户 60 秒内最多更新一次，使用 LRU 防止内存泄漏）
@@ -170,14 +175,29 @@ class OpenAIResponsesRelayService {
         headers['X-XAI-Token-Auth'] = 'xai-grok-cli'
         Object.assign(headers, grokNativeHeaders())
         const normalized = normalizeGrokResponsesBody(req.body)
+        req._grokCustomToolNames = normalized.translatedCustomToolNames
+        for (const tool of normalized.droppedUnsupportedTools) {
+          logger.warn('Dropped unsupported grok Responses tool', { ...tool, accountId: account.id })
+        }
+        if (normalized.body?.tool_choice === 'auto' && req.body?.tool_choice !== 'auto') {
+          logger.warn('Reset unsupported grok tool_choice to auto', {
+            provider: 'grok',
+            accountId: account.id,
+            tool: req.body.tool_choice
+          })
+        }
         req.body = normalized.body
         if (
+          normalized.translatedCustomToolNames.length > 0 ||
+          normalized.droppedUnsupportedTools.length > 0 ||
           normalized.droppedNamespaceTools > 0 ||
           normalized.strippedExternalWebAccess > 0 ||
           normalized.strippedNullReasoningContent > 0
         ) {
           logger.info('🧼 Normalized grok Responses tools', {
             accountId: account.id,
+            translatedCustomTools: normalized.translatedCustomToolNames.length,
+            droppedUnsupportedTools: normalized.droppedUnsupportedTools.length,
             droppedNamespaceTools: normalized.droppedNamespaceTools,
             strippedExternalWebAccess: normalized.strippedExternalWebAccess,
             strippedNullReasoningContent: normalized.strippedNullReasoningContent
@@ -669,6 +689,11 @@ class OpenAIResponsesRelayService {
       }
     }
 
+    const rewriter =
+      this.accountType === 'grok' && req._grokCustomToolNames?.length
+        ? createGrokResponseStreamRewriter(req._grokCustomToolNames)
+        : null
+
     // 监听数据流
     response.data.on('data', (chunk) => {
       try {
@@ -676,7 +701,10 @@ class OpenAIResponsesRelayService {
 
         // 转发数据给客户端
         if (!res.destroyed && !streamEnded) {
-          res.write(chunk)
+          const outbound = rewriter ? rewriter.write(chunk) : chunk
+          if (outbound.length) {
+            res.write(outbound)
+          }
           // 💓 每次成功转发后重置心跳静默计时
           heartbeat.markData()
         }
@@ -701,6 +729,12 @@ class OpenAIResponsesRelayService {
     })
 
     response.data.on('end', async () => {
+      if (rewriter && !res.destroyed && !streamEnded) {
+        const tail = rewriter.end()
+        if (tail) {
+          res.write(tail)
+        }
+      }
       streamEnded = true
       // 💓 流正常结束，停止心跳
       stopHeartbeat()
@@ -844,7 +878,10 @@ class OpenAIResponsesRelayService {
 
   // 处理非流式响应
   async _handleNormalResponse(response, res, account, apiKeyData, requestedModel, req) {
-    const responseData = response.data
+    const responseData =
+      this.accountType === 'grok' && req._grokCustomToolNames?.length
+        ? rewriteGrokResponseBody(response.data, req._grokCustomToolNames)
+        : response.data
 
     // 提取 usage 数据和实际 model
     // 支持两种格式：直接的 usage 或嵌套在 response 中的 usage
