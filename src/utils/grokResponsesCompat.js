@@ -91,6 +91,16 @@ function normalizeGrokResponsesBody(body) {
   if (Array.isArray(body.tools)) {
     next.tools = []
     for (const tool of body.tools) {
+      if (tool?.execution === 'client') {
+        result.droppedUnsupportedTools.push({
+          provider: 'grok',
+          type: tool.type,
+          name: tool.name,
+          execution: tool.execution,
+          reason: 'client-executed tools are unsupported'
+        })
+        continue
+      }
       if (tool?.type === 'custom') {
         result.translatedCustomToolNames.push(tool.name)
         const grammar = tool.format?.type === 'grammar' ? tool.format.definition : null
