@@ -1099,9 +1099,13 @@ router.get('/key-info', authenticateApiKey, async (req, res) => {
     // 按需查询 usage 数据（仅 key-info 端点需要）
     const usage = await redis.getUsageStats(keyData.id)
     const tokensUsed = usage?.total?.tokens || 0
+    const isSubscription =
+      keyData.name === 'subscription' ||
+      (Array.isArray(keyData.tags) && keyData.tags.includes('subscription-template'))
     res.json({
       id: keyData.id,
       name: keyData.name,
+      ...(isSubscription ? { billing_mode: 'notional' } : {}),
       description: keyData.description,
       permissions: keyData.permissions,
       token_limit: keyData.tokenLimit,

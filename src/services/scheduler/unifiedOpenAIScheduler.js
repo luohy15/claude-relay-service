@@ -62,21 +62,21 @@ class UnifiedOpenAIScheduler {
   // openai（ChatGPT/Codex OAuth）固定转发到 chatgpt.com，grok（grok.com 订阅 OAuth）固定转发到
   // cli-chat-proxy.grok.com；两者互不兼容，共享池/分组选择必须按 requestedModel 区分，避免把
   // grok 模型路由到 ChatGPT 后端，或把 GPT 模型路由到 grok 后端。
-  // openai-responses 默认支持所有模型，但官方 DeepSeek 账户只服务原生 DeepSeek id，
-  // 其它选择路径也必须跳过这些账户。
+  // 带命名空间的模型走 Responses；原生 GPT 走 ChatGPT，不回退到通用 Responses 池。
   _isAccountTypeCompatibleWithModel(accountType, requestedModel, provider = '') {
     const nativeDeepSeek = deepseekProvider.isNativeDeepSeekId(requestedModel)
+    const namespaced = typeof requestedModel === 'string' && requestedModel.includes('/')
     if (accountType === 'openai') {
-      return !requestedModel || (!this._isGrokModel(requestedModel) && !nativeDeepSeek)
+      return !namespaced && !this._isGrokModel(requestedModel) && !nativeDeepSeek
     }
     if (accountType === 'grok') {
-      return !!requestedModel && this._isGrokModel(requestedModel)
+      return !namespaced && this._isGrokModel(requestedModel)
     }
     if (accountType === 'openai-responses') {
       if (provider === 'deepseek') {
         return !!deepseekProvider.canonicalDeepSeekModel(requestedModel)
       }
-      return !nativeDeepSeek
+      return !requestedModel || namespaced
     }
     return true
   }
@@ -455,7 +455,7 @@ class UnifiedOpenAIScheduler {
         // Grok 模型固定走 cli-chat-proxy.grok.com，不能路由到 ChatGPT/Codex 后端
         if (!this._isAccountTypeCompatibleWithModel('openai', requestedModel)) {
           logger.debug(
-            `⏭️ Skipping OpenAI account ${account.name} - requested model ${requestedModel} is a Grok model`
+            `⏭️ Skipping OpenAI account ${account.name} - incompatible model ${requestedModel}`
           )
           continue
         }
@@ -749,12 +749,18 @@ class UnifiedOpenAIScheduler {
     }
 
     if (binding.startsWith('group:')) {
-      return await this.selectAccountFromGroup(
-        binding.replace('group:', ''),
-        sessionHash,
-        canonicalModel,
-        'deepseek'
-      )
+      try {
+        return await this.selectAccountFromGroup(
+          binding.replace('group:', ''),
+          sessionHash,
+          canonicalModel,
+          'deepseek'
+        )
+      } catch (error) {
+        if (error.code !== 'NO_DEEPSEEK_ACCOUNT') {
+          throw error
+        }
+      }
     }
 
     if (sessionHash) {

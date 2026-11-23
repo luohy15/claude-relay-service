@@ -1297,6 +1297,7 @@ const authenticateApiKey = async (req, res, next) => {
     req.apiKey = {
       id: validation.keyData.id,
       name: validation.keyData.name,
+      tags: validation.keyData.tags,
       tokenLimit: validation.keyData.tokenLimit,
       claudeAccountId: validation.keyData.claudeAccountId,
       claudeConsoleAccountId: validation.keyData.claudeConsoleAccountId, // 添加 Claude Console 账号ID
