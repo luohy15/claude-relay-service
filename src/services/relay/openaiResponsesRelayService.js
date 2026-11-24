@@ -21,6 +21,7 @@ const {
   createGrokResponseStreamRewriter
 } = require('../../utils/grokResponsesCompat')
 const deepseekProvider = require('../deepseekProvider')
+const metadataUserIdHelper = require('../../utils/metadataUserIdHelper')
 
 // lastUsedAt 更新节流（每账户 60 秒内最多更新一次，使用 LRU 防止内存泄漏）
 const lastUsedAtThrottle = new LRUCache(1000) // 最多缓存 1000 个账户
@@ -50,6 +51,249 @@ function extractCacheCreationTokens(usageData) {
   }
 
   return 0
+}
+
+const FAST_ALIAS_SESSION_MAX = 256
+
+function usableFastSessionId(value) {
+  if (typeof value !== 'string' || value.trim() === '' || value.length > FAST_ALIAS_SESSION_MAX) {
+    return null
+  }
+  return value
+}
+
+function headerString(headers, name) {
+  if (!headers || typeof headers !== 'object') {
+    return null
+  }
+  const match = Object.keys(headers).find((key) => key.toLowerCase() === name)
+  if (!match) {
+    return null
+  }
+  const value = headers[match]
+  if (typeof value === 'string') {
+    return value
+  }
+  if (Array.isArray(value)) {
+    return value.find((item) => typeof item === 'string') || null
+  }
+  return null
+}
+
+function resolveFastAliasSession(req) {
+  const body = req.body && typeof req.body === 'object' ? req.body : {}
+  if (Object.prototype.hasOwnProperty.call(body, 'session_id')) {
+    const supplied = body.session_id
+    if (supplied !== undefined && supplied !== null && String(supplied).trim() !== '') {
+      return {
+        id: usableFastSessionId(typeof supplied === 'string' ? supplied : ''),
+        assign: false
+      }
+    }
+  }
+
+  const fromHeader = usableFastSessionId(headerString(req.headers, 'x-session-id'))
+  if (fromHeader) {
+    return { id: fromHeader, assign: true }
+  }
+  const fromCacheKey = usableFastSessionId(
+    typeof body.prompt_cache_key === 'string' ? body.prompt_cache_key : ''
+  )
+  if (fromCacheKey) {
+    return { id: fromCacheKey, assign: true }
+  }
+  const extracted = metadataUserIdHelper.extractSessionId(body.metadata && body.metadata.user_id)
+  const fromMetadata = usableFastSessionId(extracted || '')
+  if (fromMetadata) {
+    return { id: fromMetadata, assign: true }
+  }
+  return { id: null, assign: false }
+}
+
+function stripFastSessionHeaders(headers) {
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === 'x-session-id') {
+      delete headers[key]
+    }
+  }
+}
+
+function contentText(content) {
+  if (typeof content === 'string') {
+    return content
+  }
+  if (!Array.isArray(content)) {
+    return ''
+  }
+  return content
+    .map((part) => {
+      if (typeof part === 'string') {
+        return part
+      }
+      return part && typeof part.text === 'string' ? part.text : ''
+    })
+    .join('')
+}
+
+function requestPrefixMaterial(body) {
+  if (!body || typeof body !== 'object') {
+    return ''
+  }
+  const parts = []
+  if (body.instructions) {
+    parts.push(contentText(body.instructions))
+  }
+  if (body.system) {
+    parts.push(contentText(body.system))
+  }
+  let sequence = Array.isArray(body.messages) ? body.messages : []
+  if (!sequence.length) {
+    if (typeof body.input === 'string') {
+      sequence = [{ role: 'user', content: body.input }]
+    } else if (Array.isArray(body.input)) {
+      sequence = body.input
+    }
+  }
+  const firstSystem = sequence.find(
+    (item) => item && (item.role === 'system' || item.role === 'developer')
+  )
+  const firstUser = sequence.find((item) => item && item.role === 'user')
+  if (firstSystem) {
+    parts.push(contentText(firstSystem.content))
+  }
+  if (firstUser) {
+    parts.push(contentText(firstUser.content))
+  }
+  return parts.join('\n').slice(0, 8192)
+}
+
+function shortHash(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    return 'none'
+  }
+  return crypto.createHash('sha256').update(value).digest('hex').slice(0, 12)
+}
+
+function createFastAliasDiag() {
+  return {
+    logged: false,
+    sessionHash: 'none',
+    provider: null,
+    tag: null,
+    metadataPresent: false,
+    cachePresent: false,
+    cacheValue: null,
+    inputPresent: false,
+    inputTokens: null,
+    outputPresent: false,
+    outputTokens: null
+  }
+}
+
+function readNumericField(source, keys) {
+  if (!source || typeof source !== 'object') {
+    return undefined
+  }
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) {
+      continue
+    }
+    const parsed = Number(source[key])
+    if (Number.isFinite(parsed)) {
+      return parsed
+    }
+  }
+  return undefined
+}
+
+function readCacheValue(usage) {
+  if (!usage || typeof usage !== 'object') {
+    return undefined
+  }
+  const detailKeys = [
+    ['input_tokens_details', 'cached_tokens'],
+    ['prompt_tokens_details', 'cached_tokens'],
+    ['input_tokens_details', 'cached_token'],
+    ['prompt_tokens_details', 'cached_token']
+  ]
+  for (const [parent, child] of detailKeys) {
+    if (!Object.prototype.hasOwnProperty.call(usage, parent)) {
+      continue
+    }
+    const value = readNumericField(usage[parent], [child])
+    if (value !== undefined) {
+      return value
+    }
+  }
+  return readNumericField(usage, ['cache_read_input_tokens'])
+}
+
+function noteFastUsage(diag, usage) {
+  if (!diag || !usage || typeof usage !== 'object') {
+    return
+  }
+  const cacheValue = readCacheValue(usage)
+  if (cacheValue !== undefined) {
+    diag.cachePresent = true
+    diag.cacheValue = cacheValue
+  }
+  const input = readNumericField(usage, ['input_tokens', 'prompt_tokens'])
+  if (input !== undefined) {
+    diag.inputPresent = true
+    diag.inputTokens = input
+  }
+  const output = readNumericField(usage, ['output_tokens', 'completion_tokens'])
+  if (output !== undefined) {
+    diag.outputPresent = true
+    diag.outputTokens = output
+  }
+}
+
+function captureFastAliasEvidence(diag, payload) {
+  if (!diag || !payload || typeof payload !== 'object' || payload.pipe) {
+    return
+  }
+  const metadata =
+    payload.openrouter_metadata || (payload.response && payload.response.openrouter_metadata)
+  if (metadata && typeof metadata === 'object') {
+    diag.metadataPresent = true
+    const available =
+      metadata.endpoints && Array.isArray(metadata.endpoints.available)
+        ? metadata.endpoints.available
+        : []
+    const selected = available.find((item) => item && item.selected && item.provider)
+    const attempts = Array.isArray(metadata.attempts) ? metadata.attempts : []
+    const attempt = [...attempts].reverse().find((item) => item && item.provider)
+    const provider = (selected && selected.provider) || (attempt && attempt.provider) || null
+    if (provider) {
+      diag.provider = String(provider)
+    }
+    if (typeof metadata.strategy === 'string' && metadata.strategy) {
+      diag.tag = metadata.strategy
+    }
+  }
+  noteFastUsage(diag, payload.usage)
+  noteFastUsage(diag, payload.response && payload.response.usage)
+  noteFastUsage(diag, payload.message && payload.message.usage)
+}
+
+function finishFastAliasDiagnostic(req, payload) {
+  const diag = req && req._fastAliasDiag
+  if (!diag || diag.logged) {
+    return
+  }
+  diag.logged = true
+  captureFastAliasEvidence(diag, payload)
+  const cache = diag.cachePresent ? `present:${diag.cacheValue}` : 'absent'
+  const input = diag.inputPresent ? String(diag.inputTokens) : 'absent'
+  const output = diag.outputPresent ? String(diag.outputTokens) : 'absent'
+  logger.info(
+    `DeepSeek route=openrouter-fast diag session=${diag.sessionHash || 'none'} ` +
+      `prefix=${shortHash(requestPrefixMaterial(req.body))} ` +
+      `provider=${diag.provider || 'unknown'} tag=${diag.tag || 'none'} ` +
+      `cache=${cache} in=${input} out=${output} ` +
+      `metadata=${diag.metadataPresent ? 'present' : 'absent'}`
+  )
 }
 
 function fastAliasRestrictedBody(req) {
@@ -140,12 +384,14 @@ class OpenAIResponsesRelayService {
       // provider.sort=throughput, and only on an OpenRouter account.
       const fastRoute = deepseekProvider.openrouterFastRoute(req.body?.model)
       if (fastRoute) {
+        req._fastAliasDiag = createFastAliasDiag()
         if (deepseekProvider.isOpenrouterFastModelRestricted(apiKeyData, req.body?.model)) {
           req.removeListener('close', handleClientDisconnect)
           res.removeListener('close', handleClientDisconnect)
           logger.info(
             `DeepSeek route=openrouter-fast blocked=model-restriction accountId=${account.id}`
           )
+          finishFastAliasDiagnostic(req)
           return res.status(403).json(fastAliasRestrictedBody(req))
         }
         if (!deepseekProvider.isOpenRouterBaseApi(fullAccount.baseApi)) {
@@ -154,6 +400,7 @@ class OpenAIResponsesRelayService {
           logger.warn('OpenRouter fast alias requires an OpenRouter account', {
             accountId: account.id
           })
+          finishFastAliasDiagnostic(req)
           return res.status(502).json({
             error: {
               type: 'api_error',
@@ -166,6 +413,11 @@ class OpenAIResponsesRelayService {
           model: fastRoute.model,
           provider: fastRoute.provider
         }
+        const resolvedSession = resolveFastAliasSession(req)
+        if (resolvedSession.assign && resolvedSession.id) {
+          req.body.session_id = resolvedSession.id
+        }
+        req._fastAliasDiag.sessionHash = shortHash(resolvedSession.id)
         logger.info(
           `DeepSeek route=openrouter-fast upstream=${fastRoute.model} accountId=${account.id}`
         )
@@ -227,6 +479,10 @@ class OpenAIResponsesRelayService {
         ...filterForOpenAI(req.headers),
         Authorization: `Bearer ${fullAccount.apiKey}`,
         'Content-Type': 'application/json'
+      }
+      if (fastRoute) {
+        headers['X-OpenRouter-Metadata'] = 'enabled'
+        stripFastSessionHeaders(headers)
       }
 
       // Grok（grok.com 订阅 OAuth）专属：
@@ -365,6 +621,7 @@ class OpenAIResponsesRelayService {
             resets_in_seconds: resetsInSeconds
           }
         }
+        finishFastAliasDiagnostic(req, errorResponse)
         return res.status(429).json(errorResponse)
       }
 
@@ -487,6 +744,7 @@ class OpenAIResponsesRelayService {
         req.removeListener('close', handleClientDisconnect)
         res.removeListener('close', handleClientDisconnect)
 
+        finishFastAliasDiagnostic(req, errorData)
         return res
           .status(response.status)
           .json(upstreamErrorHelper.sanitizeErrorForClient(errorData))
@@ -540,6 +798,7 @@ class OpenAIResponsesRelayService {
 
       // 如果已经发送了响应头，直接结束
       if (res.headersSent) {
+        finishFastAliasDiagnostic(req)
         return res.end()
       }
 
@@ -611,13 +870,16 @@ class OpenAIResponsesRelayService {
             }
           }
 
+          finishFastAliasDiagnostic(req, unauthorizedResponse)
           return res.status(401).json(unauthorizedResponse)
         }
 
+        finishFastAliasDiagnostic(req, errorData)
         return res.status(status).json(upstreamErrorHelper.sanitizeErrorForClient(errorData))
       }
 
       // 其他错误
+      finishFastAliasDiagnostic(req)
       return res.status(500).json({
         error: {
           message: 'Internal server error',
@@ -671,6 +933,7 @@ class OpenAIResponsesRelayService {
             }
 
             const eventData = JSON.parse(jsonStr)
+            captureFastAliasEvidence(req._fastAliasDiag, eventData)
 
             // 检查是否是 response.completed 事件（OpenAI-Responses 格式）
             if (eventData.type === 'response.completed' && eventData.response) {
@@ -894,6 +1157,8 @@ class OpenAIResponsesRelayService {
       req.removeListener('close', handleClientDisconnect)
       res.removeListener('close', handleClientDisconnect)
 
+      finishFastAliasDiagnostic(req)
+
       if (!res.destroyed) {
         res.end()
       }
@@ -909,6 +1174,7 @@ class OpenAIResponsesRelayService {
       streamEnded = true
       // 💓 出错时停止心跳
       stopHeartbeat()
+      finishFastAliasDiagnostic(req)
       logger.error('Stream error:', error)
 
       // 清理监听器
@@ -1016,6 +1282,7 @@ class OpenAIResponsesRelayService {
 
     // 返回响应
     res.status(response.status).json(responseData)
+    finishFastAliasDiagnostic(req, responseData)
 
     logger.info('Normal response completed', {
       accountId: account.id,
