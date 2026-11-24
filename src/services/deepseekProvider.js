@@ -7,6 +7,8 @@
  * not aliases.
  */
 
+const { getEffectiveModel } = require('../utils/modelHelper')
+
 const DEFAULT_API_URL = 'https://api.deepseek.com/anthropic'
 const RESPONSES_DEFAULT_API_URL = 'https://api.deepseek.com'
 const CANONICAL_MODELS = ['deepseek-flash', 'deepseek-v4-pro']
@@ -527,6 +529,59 @@ function officialFirstModel(model) {
     : null
 }
 
+const OPENROUTER_FAST_ALIAS = 'deepseek/deepseek-v4.1-flash-1017-fast'
+const OPENROUTER_FAST_MODEL = 'deepseek/deepseek-v4.1-flash-1017'
+
+function isOpenRouterBaseApi(baseApi) {
+  if (typeof baseApi !== 'string' || !baseApi.trim()) {
+    return false
+  }
+  let parsed
+  try {
+    parsed = new URL(baseApi.trim())
+  } catch (error) {
+    return false
+  }
+  return (
+    parsed.protocol === 'https:' &&
+    parsed.hostname === 'openrouter.ai' &&
+    !parsed.port &&
+    !parsed.username &&
+    !parsed.password &&
+    !parsed.search &&
+    !parsed.hash
+  )
+}
+
+function openrouterFastRoute(model) {
+  if (stripCapabilitySuffix(model) !== OPENROUTER_FAST_ALIAS) {
+    return null
+  }
+  return {
+    model: OPENROUTER_FAST_MODEL,
+    provider: {
+      sort: 'throughput'
+    }
+  }
+}
+
+function isOpenrouterFastModelRestricted(apiKey, model) {
+  const route = openrouterFastRoute(model)
+  if (!route) {
+    return false
+  }
+  if (
+    !apiKey?.enableModelRestriction ||
+    !Array.isArray(apiKey.restrictedModels) ||
+    apiKey.restrictedModels.length === 0
+  ) {
+    return false
+  }
+  return [model, stripCapabilitySuffix(model), route.model, officialFirstModel(route.model)]
+    .filter((candidate) => candidate)
+    .some((candidate) => apiKey.restrictedModels.includes(getEffectiveModel(candidate)))
+}
+
 function attemptFailure({ status, code, headers, committed = false }) {
   const transient = status
     ? [408, 429, 500, 502, 503, 504, 529].includes(status)
@@ -545,6 +600,9 @@ function attemptFailure({ status, code, headers, committed = false }) {
 
 module.exports = {
   officialFirstModel,
+  isOpenRouterBaseApi,
+  openrouterFastRoute,
+  isOpenrouterFastModelRestricted,
   attemptFailure,
   RESPONSES_DEFAULT_API_URL,
   isDeepSeekResponsesBaseApi,

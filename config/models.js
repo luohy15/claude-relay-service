@@ -74,7 +74,11 @@ const PLATFORM_TEST_MODELS = {
   'openai-responses': [
     ...OPENAI_MODELS,
     { value: 'deepseek-flash', label: 'DeepSeek Flash' },
-    { value: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro' }
+    { value: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro' },
+    {
+      value: 'deepseek/deepseek-v4.1-flash-1017-fast',
+      label: 'DeepSeek V4.1 Flash Fast'
+    }
   ],
   'azure-openai': [],
   droid: CLAUDE_MODELS,

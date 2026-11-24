@@ -52,6 +52,34 @@ function extractCacheCreationTokens(usageData) {
   return 0
 }
 
+function fastAliasRestrictedBody(req) {
+  const message = '暂无该模型访问权限'
+  const path = req.path || ''
+  const originalUrl = req.originalUrl || ''
+  const anthropicMessages =
+    req.baseUrl === '/api' &&
+    (path === '/v1/messages' ||
+      path === '/messages' ||
+      originalUrl.includes('/v1/messages') ||
+      originalUrl.includes('/messages'))
+  if (anthropicMessages) {
+    return {
+      type: 'error',
+      error: {
+        type: 'permission_error',
+        message
+      }
+    }
+  }
+  return {
+    error: {
+      message,
+      type: 'permission_error',
+      code: 'model_restricted'
+    }
+  }
+}
+
 class OpenAIResponsesRelayService {
   // options.accountService: 账户存取服务（需暴露 getAccount/updateAccount/updateAccountUsage/updateUsageQuota）
   // options.accountType: 记录到 usage/上游错误处理里的账户类型标识
@@ -107,6 +135,41 @@ class OpenAIResponsesRelayService {
       // 监听客户端断开事件
       req.once('close', handleClientDisconnect)
       res.once('close', handleClientDisconnect)
+
+      // Fast alias stays local. Upstream only sees the real slug plus
+      // provider.sort=throughput, and only on an OpenRouter account.
+      const fastRoute = deepseekProvider.openrouterFastRoute(req.body?.model)
+      if (fastRoute) {
+        if (deepseekProvider.isOpenrouterFastModelRestricted(apiKeyData, req.body?.model)) {
+          req.removeListener('close', handleClientDisconnect)
+          res.removeListener('close', handleClientDisconnect)
+          logger.info(
+            `DeepSeek route=openrouter-fast blocked=model-restriction accountId=${account.id}`
+          )
+          return res.status(403).json(fastAliasRestrictedBody(req))
+        }
+        if (!deepseekProvider.isOpenRouterBaseApi(fullAccount.baseApi)) {
+          req.removeListener('close', handleClientDisconnect)
+          res.removeListener('close', handleClientDisconnect)
+          logger.warn('OpenRouter fast alias requires an OpenRouter account', {
+            accountId: account.id
+          })
+          return res.status(502).json({
+            error: {
+              type: 'api_error',
+              message: 'OpenRouter fast alias requires an OpenRouter account'
+            }
+          })
+        }
+        req.body = {
+          ...req.body,
+          model: fastRoute.model,
+          provider: fastRoute.provider
+        }
+        logger.info(
+          `DeepSeek route=openrouter-fast upstream=${fastRoute.model} accountId=${account.id}`
+        )
+      }
 
       // 构建目标 URL（根据 providerEndpoint 配置决定端点路径）
       const providerEndpoint = fullAccount.providerEndpoint || 'responses'
