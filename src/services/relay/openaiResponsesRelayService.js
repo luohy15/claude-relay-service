@@ -22,6 +22,7 @@ const {
 } = require('../../utils/grokResponsesCompat')
 const deepseekProvider = require('../deepseekProvider')
 const metadataUserIdHelper = require('../../utils/metadataUserIdHelper')
+const { removeBillingHeaderFromSystem } = require('../../utils/billingHeader')
 
 // lastUsedAt 更新节流（每账户 60 秒内最多更新一次，使用 LRU 防止内存泄漏）
 const lastUsedAtThrottle = new LRUCache(1000) // 最多缓存 1000 个账户
@@ -51,6 +52,21 @@ function extractCacheCreationTokens(usageData) {
   }
 
   return 0
+}
+
+function stripForwardedBillingHeader(body) {
+  if (!body || typeof body !== 'object' || body.system === undefined || body.system === null) {
+    return
+  }
+  const filtered = removeBillingHeaderFromSystem(body.system)
+  if (filtered === undefined || (Array.isArray(filtered) && filtered.length === 0)) {
+    delete body.system
+    return
+  }
+  if (Array.isArray(body.system) && filtered.length === body.system.length) {
+    return
+  }
+  body.system = filtered
 }
 
 const FAST_ALIAS_SESSION_MAX = 256
@@ -379,6 +395,10 @@ class OpenAIResponsesRelayService {
       // 监听客户端断开事件
       req.once('close', handleClientDisconnect)
       res.once('close', handleClientDisconnect)
+
+      // The billing header carries a per-request cch nonce. Strip it before
+      // alias rewrite, session injection, and the prefix diagnostic.
+      stripForwardedBillingHeader(req.body)
 
       // Fast alias stays local. Upstream only sees the real slug plus
       // provider.sort=throughput, and only on an OpenRouter account.
